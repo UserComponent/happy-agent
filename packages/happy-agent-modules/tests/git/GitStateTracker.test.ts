@@ -257,6 +257,47 @@ describe("GitStateTracker scheduling", () => {
         }
     });
 
+    it("checks a watched repository only every half hour while its events stay quiet", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000);
+        const scan = testScan();
+        let observer: WorkingTreeObserver | undefined;
+        const tree = {
+            dispose: () => undefined,
+            watch: (_root: string, watching: WorkingTreeObserver) => {
+                observer = watching;
+                return () => undefined;
+            },
+        } as unknown as WorkingTreeWatcher;
+        const tracker = new GitStateTracker(createRootContext(), scan.run, owner(), tree);
+        // Subscriptions renew well inside the watch lifetime while a client is looking.
+        const idle = async (milliseconds: number) => {
+            for (let elapsed = 0; elapsed < milliseconds; elapsed += 60_000) {
+                tracker.watch(entity);
+                await advance(60_000);
+            }
+        };
+        try {
+            await startTracking(tracker);
+            observer?.onWatching?.(true);
+            await advance(1);
+            expect(scan.fullStatusReads).toBe(2);
+
+            await idle(29 * 60_000);
+            expect(scan.fullStatusReads).toBe(2);
+            await idle(2 * 60_000);
+            expect(scan.fullStatusReads).toBe(3);
+            // Quiet checks do not stretch the safety net any further.
+            await idle(28 * 60_000);
+            expect(scan.fullStatusReads).toBe(3);
+            await idle(3 * 60_000);
+            expect(scan.fullStatusReads).toBe(4);
+            expect(scan.diffReads).toBe(1);
+        } finally {
+            tracker.dispose();
+        }
+    });
+
     it("runs at most two full repository scans concurrently", async () => {
         vi.useFakeTimers();
         vi.setSystemTime(1_000);
