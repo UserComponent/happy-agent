@@ -228,6 +228,7 @@ import type {
     ListWorkspacesQuery,
     RenameWorkspaceRequest,
     ReorderWorkspaceRequest,
+    UpdateWorkspaceRequest,
     WorkspaceListResponse,
     WorkspaceResponse,
 } from "./protocol/workspaces.js";
@@ -1193,6 +1194,24 @@ export class HappyAgentClient {
     async renameWorkspace(
         workspaceId: Cuid2,
         request: RenameWorkspaceRequest,
+        options: VersionedRequestOptions,
+    ): Promise<WorkspaceResponse> {
+        return await this.#json({
+            method: "PATCH",
+            path: `v0/workspaces/${encodeURIComponent(workspaceId)}`,
+            json: request,
+            ifMatch: options.ifMatch,
+            signal: options.signal,
+        });
+    }
+
+    /**
+     * `PATCH /v0/workspaces/:workspaceId` with a name, a comparison branch, or both. Daemons that
+     * do not report `comparisonBase` on the workspace reject a request that carries it.
+     */
+    async updateWorkspace(
+        workspaceId: Cuid2,
+        request: UpdateWorkspaceRequest,
         options: VersionedRequestOptions,
     ): Promise<WorkspaceResponse> {
         return await this.#json({
