@@ -15,6 +15,14 @@ export {
 } from "./createHostWatcher.js";
 export { createHostShell, type HostShellOptions } from "./createHostShell.js";
 export {
+    createHostCommandWorker,
+    HostCommandWorkerUnavailableError,
+    type HostCommandWorker,
+    type HostCommandWorkerOptions,
+    type HostCommandWorkerResult,
+    type HostCommandWorkerRun,
+} from "./createHostCommandWorker.js";
+export {
     createProtectedPathMonitor,
     type ProtectedPathMonitor,
 } from "./impl/createProtectedPathMonitor.js";
