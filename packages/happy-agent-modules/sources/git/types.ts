@@ -117,6 +117,8 @@ export const gitTrackedEntitySchema = Type.Object(
         projectId: Type.String({ minLength: 1 }),
         /** The branch the workspace was created from. */
         recordedBaseRef: Type.Optional(Type.String({ minLength: 1, maxLength: 1_024 })),
+        /** The commit the workspace was created at; its record applies only while HEAD holds it. */
+        recordedBaseCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{7,64}$" })),
         workspaceId: Type.Optional(Type.String({ minLength: 1 })),
     },
     { additionalProperties: false },

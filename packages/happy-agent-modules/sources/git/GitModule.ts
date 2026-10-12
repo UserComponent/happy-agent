@@ -936,8 +936,16 @@ export class GitModule implements AgentModule {
                 },
                 restore: (entity) => {
                     const entry = this.#snapshots?.get(entityKey(entity));
-                    // A state recorded for another path is not this one.
-                    if (entry === undefined || entry.entity.path !== entity.path) return undefined;
+                    // A state measured against another comparison branch is not this one.
+                    if (
+                        entry === undefined ||
+                        entry.entity.path !== entity.path ||
+                        entry.entity.comparisonBase !== entity.comparisonBase ||
+                        entry.entity.recordedBaseRef !== entity.recordedBaseRef ||
+                        entry.entity.recordedBaseCommit !== entity.recordedBaseCommit
+                    ) {
+                        return undefined;
+                    }
                     return {
                         ...(entry.fingerprint === undefined
                             ? {}

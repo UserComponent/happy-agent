@@ -815,7 +815,8 @@ function sameEntity(left: GitTrackedEntity, right: GitTrackedEntity): boolean {
         left.projectId === right.projectId &&
         left.workspaceId === right.workspaceId &&
         left.comparisonBase === right.comparisonBase &&
-        left.recordedBaseRef === right.recordedBaseRef
+        left.recordedBaseRef === right.recordedBaseRef &&
+        left.recordedBaseCommit === right.recordedBaseCommit
     );
 }
 
@@ -826,6 +827,9 @@ function comparisonPreferences(entity: GitTrackedEntity): GitComparisonPreferenc
         ...(entity.recordedBaseRef === undefined
             ? {}
             : { recordedBaseRef: entity.recordedBaseRef }),
+        ...(entity.recordedBaseCommit === undefined
+            ? {}
+            : { recordedBaseCommit: entity.recordedBaseCommit }),
     };
 }
 
