@@ -1342,7 +1342,18 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                 "Changes require a workspace at the root of an available Git repository.",
             );
         }
-        return { success: true, git: this.#git.resource(await this.#git.snapshot(root.root)) };
+        const workspaceId = await this.#workspaces.workspaceForAgent(ctx, agentId);
+        const baseRef =
+            workspaceId === undefined
+                ? undefined
+                : (await this.#workspaces.get(ctx, workspaceId))?.baseRef;
+        const snapshot = await this.#git.snapshot(
+            root.root,
+            undefined,
+            undefined,
+            baseRef === undefined ? {} : { recordedBaseRef: baseRef },
+        );
+        return { success: true, git: this.#git.resource(snapshot) };
     }
 
     async readFile(
@@ -2536,6 +2547,9 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                 : this.#gitSummary(agentId, {
                       path: cwd,
                       projectId: owner.project.id,
+                      // The same entity the workspace API tracks: one without the recorded base
+                      // would be measured against the default branch and replace that tracker.
+                      ...(owner.baseRef === undefined ? {} : { recordedBaseRef: owner.baseRef }),
                       ...(owner.workspace === undefined ? {} : { workspaceId: owner.workspace.id }),
                   });
         let lastUserOrFinalAssistantTextMessageAt: number | undefined;
@@ -2651,6 +2665,8 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
     ): Promise<{
         bot?: HappySessionSnapshot["bot"];
         avatarVersion?: number;
+        /** The branch the agent's workspace was created from. */
+        baseRef?: string;
         gitBranch?: string;
         project?: { id: string; kind: "home" | "regular"; name: string };
         workspace?: { id: string; name: string };
@@ -2676,6 +2692,7 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                 if (workspace !== undefined) {
                     const project = await this.#projects.get(ctx, workspace.projectRef);
                     return {
+                        ...(workspace.baseRef === undefined ? {} : { baseRef: workspace.baseRef }),
                         ...(workspace.branch === undefined ? {} : { gitBranch: workspace.branch }),
                         ...(project === undefined
                             ? {}
