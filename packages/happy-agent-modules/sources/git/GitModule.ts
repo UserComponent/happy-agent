@@ -4,10 +4,16 @@ import { homedir } from "node:os";
 
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
-import type { AgentModule } from "@slopus/happy-agent-base";
+import {
+    agentConfig,
+    type AgentModule,
+    type AgentModuleHooks,
+    type AgentModuleScope,
+} from "@slopus/happy-agent-base";
 import { computePermissions, type Compute } from "@slopus/happy-agent-compute";
 import { createRootContext, detach, type Context, type RootContext } from "@steve.kite/stdlib";
 
+import type { ComputeModule } from "../compute/index.js";
 import type { ConfigModule } from "../config/index.js";
 import type { RunnerRunOptions, RunnersModule } from "../runners/index.js";
 import type { GitCommandOptions, GitCommandResult, GitCommandRunner } from "./GitCommandRunner.js";
@@ -22,6 +28,7 @@ import { countUntrackedFileLines, type UntrackedFileCount } from "./countUntrack
 import { createGitWorktree } from "./createGitWorktree.js";
 import { detectGitDefaultBranch } from "./detectGitDefaultBranch.js";
 import { cloneOnRunner } from "./impl/cloneOnRunner.js";
+import { GitScanWorkers } from "./impl/GitScanWorkers.js";
 import { GitSnapshotStore } from "./impl/GitSnapshotStore.js";
 import { entityKey, GitStateTracker } from "./impl/GitStateTracker.js";
 import { RunnerGitCredentialTunnel } from "./impl/RunnerGitCredentialTunnel.js";
@@ -174,6 +181,13 @@ export class GitModule implements AgentModule {
     readonly #runnerMachines = new Map<string, GitMachine>();
     /** The last state of each watched repository, kept across restarts. */
     readonly #snapshots: GitSnapshotStore | undefined;
+    readonly #scanWorkers = new GitScanWorkers(
+        () => this.#root(),
+        () => this.#tracker?.paths() ?? [],
+    );
+    /** Each running agent's hold on its folder's scan worker, released when the run settles. */
+    readonly #runHolds = new Map<string, () => void>();
+    readonly #compute: ComputeModule | undefined;
     readonly #tunnel = new RunnerGitCredentialTunnel();
     #config: ConfigModule | undefined;
     /** Whether Git is reached directly, which is what makes a credential-carrying runner possible. */
@@ -187,24 +201,31 @@ export class GitModule implements AgentModule {
     #tree: WorkingTreeWatcher | undefined;
     #version = 0;
 
-    constructor(config?: ConfigModule, runners?: RunnersModule) {
+    constructor(config?: ConfigModule, runners?: RunnersModule, compute?: ComputeModule) {
         this.#config = config;
         this.#runners = runners;
         this.#snapshots =
             config === undefined
                 ? undefined
                 : new GitSnapshotStore(config.configuration.paths.gitSnapshotsPath);
+        this.#compute = compute;
         this.#foreground = directGitCommandRunner;
+        // Windows pays seconds of sandbox setup per one-shot command, so scans there share one
+        // read-only worker per workspace instead.
         this.#scan =
-            config === undefined
-                ? runScanGit
-                : async (options) => {
-                      const gitCeilingDirectories = config.gitCeilingDirectories;
-                      return await runScanGit({
-                          ...options,
-                          ...(gitCeilingDirectories === undefined ? {} : { gitCeilingDirectories }),
-                      });
-                  };
+            process.platform === "win32"
+                ? this.#scanWorkers.scanner(() => config?.gitCeilingDirectories)
+                : config === undefined
+                  ? runScanGit
+                  : async (options) => {
+                        const gitCeilingDirectories = config.gitCeilingDirectories;
+                        return await runScanGit({
+                            ...options,
+                            ...(gitCeilingDirectories === undefined
+                                ? {}
+                                : { gitCeilingDirectories }),
+                        });
+                    };
         this.#read = gitCommandRunnerFromScanGitRunner(this.#scan);
     }
 
@@ -226,11 +247,36 @@ export class GitModule implements AgentModule {
     /**
      * Adopts the collection's lifetime so watchers and background scans outlive the call that
      * started them, and reads the Git state the previous daemon left, so a client reconnecting
-     * after a restart sees it at once. Git contributes no tools, instructions, or hooks.
+     * after a restart sees it at once. Git contributes no tools or instructions; its only hooks
+     * prepare Windows scan sandboxes for agent runs.
      */
-    readonly beforeStart = async (ctx: Context): Promise<void> => {
+    readonly beforeStart = async (ctx: Context): Promise<AgentModuleHooks> => {
         this.#lifetime ??= detach(ctx);
         await this.#snapshots?.load();
+        return this.#hooks;
+    };
+
+    readonly #hooks: AgentModuleHooks = {
+        /**
+         * An agent run is about to change its folder, and the tracker will scan it right after.
+         * The folder's scan sandbox starts now in the background, so that scan does not wait for
+         * a sandbox logon, and stays up until the run settles and five idle minutes pass.
+         */
+        beforeAgentLoop: (ctx: Context, scope: AgentModuleScope): void => {
+            if (process.platform !== "win32" || this.#disposed || !this.#direct) return;
+            const config = agentConfig(ctx);
+            const folder = config === undefined ? undefined : this.#compute?.hostFolderOf(config);
+            if (folder === undefined) return;
+            this.#runHolds.get(scope.agent.id)?.();
+            this.#runHolds.set(
+                scope.agent.id,
+                this.#scanWorkers.hold(folder, this.#config?.gitCeilingDirectories),
+            );
+        },
+        afterAgentSettled: (_ctx: Context, scope: AgentModuleScope): void => {
+            this.#runHolds.get(scope.agent.id)?.();
+            this.#runHolds.delete(scope.agent.id);
+        },
     };
 
     // --- Paths and names -------------------------------------------------------------------
@@ -882,6 +928,8 @@ export class GitModule implements AgentModule {
         this.#tree?.dispose();
         this.#tree = undefined;
         void this.#snapshots?.dispose();
+        this.#runHolds.clear();
+        this.#scanWorkers.dispose();
         this.#tunnel.close();
         this.#runnerMachines.clear();
         this.#observers.clear();
