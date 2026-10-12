@@ -55,8 +55,24 @@ export const GIT_WATCHED_RECONCILE_STALE_AFTER_MS = RECURSIVE_WATCH_STALE_MS;
  */
 export interface GitStateTrackerOwner {
     deliver(ctx: Context, entity: GitTrackedEntity, snapshot: GitChangeSnapshot): Promise<void>;
+    /** Records a repository's latest scanned state for the next daemon to start from. */
+    remember?(
+        entity: GitTrackedEntity,
+        state: GitChangeState,
+        fingerprint: string | undefined,
+    ): void;
     report(ctx: Context, error: unknown, entity: GitTrackedEntity): void;
+    /** What a previous daemon last knew about a repository, if anything. */
+    restore?(entity: GitTrackedEntity): GitRestoredState | undefined;
     stamp(state: GitChangeState): GitChangeSnapshot;
+}
+
+/** A repository's state as a previous daemon left it. */
+export interface GitRestoredState {
+    fingerprint?: string;
+    /** Whether something was left out, so the state is only shown until a full scan replaces it. */
+    partial: boolean;
+    state: GitChangeState;
 }
 
 interface RepositoryTracker {
@@ -85,6 +101,11 @@ interface RepositoryTracker {
     reconcileDelayMs: number;
     /** Whether the queued scan is only a stale check, which a matching fingerprint satisfies. */
     reconciling: boolean;
+    /**
+     * A snapshot restored from a previous daemon awaiting its first check: `"verify"` when a
+     * matching fingerprint proves it current, `"rescan"` when only a full scan can replace it.
+     */
+    restored: "rescan" | "verify" | undefined;
     scanController: AbortController | undefined;
     scanning: boolean;
     snapshot: GitChangeSnapshot | undefined;
@@ -225,6 +246,7 @@ export class GitStateTracker {
             reconcileAfterScan: false,
             reconcileDelayMs: GIT_RECONCILE_STALE_AFTER_MS,
             reconciling: false,
+            restored: undefined,
             scanController: undefined,
             scanning: false,
             snapshot: undefined,
@@ -234,6 +256,17 @@ export class GitStateTracker {
             unwatch: undefined,
             unwatchTree: undefined,
         };
+        // What the previous daemon knew is served at once; the first check proves or replaces it.
+        const restored = this.#owner.restore?.(entity);
+        if (restored !== undefined) {
+            tracker.snapshot = this.#owner.stamp(restored.state);
+            tracker.snapshotDelivered = true;
+            tracker.fingerprint = restored.fingerprint;
+            // Refs may have moved while no daemon watched them, so the base is proved at once.
+            tracker.fullScanAt = Number.NEGATIVE_INFINITY;
+            tracker.restored =
+                restored.partial || restored.fingerprint === undefined ? "rescan" : "verify";
+        }
         this.#trackers.set(key, tracker);
         this.#evictExpired();
         if (!this.#trackers.has(key)) return;
@@ -471,6 +504,15 @@ export class GitStateTracker {
     }
 
     #watchChanged(tracker: RepositoryTracker, change: GitRepositoryChange): void {
+        if (change.kind === "armed" && tracker.restored !== undefined) {
+            const verify = tracker.restored === "verify";
+            tracker.restored = undefined;
+            // A restored snapshot only has to be proved current, queued like any stale check.
+            if (verify) {
+                this.#reconcileBy(tracker, Date.now());
+                return;
+            }
+        }
         if (
             change.kind === "refs" &&
             !gitReferenceChangeAffectsSnapshot(tracker.snapshot, change.entry)
@@ -641,6 +683,7 @@ export class GitStateTracker {
                 await this.#owner.deliver(ctx, tracker.entity, snapshot);
                 tracker.snapshotDelivered = true;
             }
+            this.#owner.remember?.(tracker.entity, state, scanned.fingerprint);
             this.#settleReconcile(tracker, unchanged);
         } catch (error) {
             if (this.#disposed || tracker.generation !== generation) return;
