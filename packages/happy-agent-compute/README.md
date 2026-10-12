@@ -297,6 +297,14 @@ The runner is built so that sharing it never weakens the sandbox:
   another. Commands may have a pseudo-terminal and input, exactly as before.
 - **One private desktop per runner.** Commands share the runner's desktop instead of creating one
   each.
+- **Its read restrictions are re-checked before every command.** Deny-read ACLs belong to the
+  sandbox group, and every setup reconciles the group's whole set to its own workspace, so another
+  workspace's setup can revoke a deny this runner relies on: the user profile, denied to a
+  workspace outside it, is the important case. Before each command the runner compares the
+  persisted deny-read state with what its own setup left there, and repeats its setup refresh when
+  another setup changed it. A command therefore starts with its deny set in force, exactly as a
+  one-shot command does; if the refresh fails, the command is refused. The scan worker does the
+  same.
 - **A crash is loud and bounded.** If the runner dies, every command it was running ends with an
   error saying so; none is left waiting. The next command starts a new runner, but only after a
   backoff that starts at one second, doubles up to five minutes, and resets once a runner has
