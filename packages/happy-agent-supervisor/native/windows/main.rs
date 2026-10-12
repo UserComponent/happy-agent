@@ -23,7 +23,6 @@ struct Policy {
     #[serde(default)] denied_read_paths: Vec<PathBuf>,
     #[serde(default)] allowed_write_paths: Vec<PathBuf>,
     #[serde(default)] denied_write_paths: Vec<PathBuf>,
-    #[serde(default)] denied_write_file_paths: Vec<PathBuf>,
     network: Network,
 }
 #[derive(Deserialize)]
@@ -93,7 +92,7 @@ async fn run() -> Result<i32> {
     if !p.network.allowed_hosts.is_empty() || p.network.outgoing_proxy.is_some() {bail!("Windows host allowlist proxy is not available in this build")}
     if p.network.egress && !p.network.local_binding {bail!("Windows independent listener restriction is not available in this build")}
     if !p.network.egress && p.network.local_binding {bail!("Windows loopback-only networking requires a separate sandbox identity and is not available in this build")}
-    for path in p.allowed_read_paths.iter().chain(&p.allowed_write_paths).chain(&p.denied_read_paths).chain(&p.denied_write_paths).chain(&p.denied_write_file_paths) {
+    for path in p.allowed_read_paths.iter().chain(&p.allowed_write_paths).chain(&p.denied_read_paths).chain(&p.denied_write_paths) {
         if !path.is_absolute(){bail!("permission paths must be absolute: {}",path.display())}
         if path.components().any(|part| matches!(part,std::path::Component::ParentDir)) {bail!("permission paths must be normalized: {}",path.display())}
     }
@@ -123,25 +122,15 @@ async fn run() -> Result<i32> {
         }
         denied_read.push(AbsolutePathBuf::try_from(path)?);
     }
-    // The Windows product policy permits protected placeholders. Root project files
-    // must be files (an empty happy.toml is valid), while protected directories
-    // are materialized by the pinned sandbox before their deny ACEs are applied.
-    // Missing denies outside writable roots need no object: creation is already denied.
-    for path in &p.denied_write_file_paths {
-        if !p.denied_write_paths.contains(path) {bail!("protected file must also be denied for writing: {}",path.display())}
-        if path_in_write_roots(path,&write_roots) && !path.exists() {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(file) => {file.sync_all().context("flush protected file placeholder")?;},
-                Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists => {},
-                Err(error) => return Err(error).with_context(||format!("create protected file placeholder {}",path.display())),
-            }
-        }
-    }
     let denied_write=p.denied_write_paths.into_iter()
         // Outside every writable root the restricted token already denies writes.
         // Passing those paths to Codex's fallback adds each fresh scratch SID to
         // their permanent ACL, eventually exhausting Windows' 64 KiB ACL limit.
         .filter(|path|write_roots.iter().any(|root| codex_windows_sandbox::workspace_write_root_overlaps_path(root,path)))
+        // A deny ACE needs an object to attach to, and the pinned setup helper would create a
+        // missing one as an empty directory. Protected paths must stay absent instead, so a
+        // missing one is left to the caller, which removes it if a command creates it.
+        .filter(|path|path.exists())
         .map(AbsolutePathBuf::try_from).collect::<Result<Vec<_>,_>>()?;
     let profile:PermissionProfile=serde_json::from_value(json!({"type":"managed","file_system":{"type":"restricted","entries":entries},"network":if p.network.egress {"enabled"} else {"restricted"}}))?;
     let roots=vec![AbsolutePathBuf::try_from(cwd.clone())?];
