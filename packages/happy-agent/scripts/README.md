@@ -145,7 +145,13 @@ First restricted execution needs Happy's native sandbox provisioning. You can
 inspect it with `happy-agent sandbox status` and initialize it explicitly with
 `happy-agent sandbox setup`. Windows may request UAC for Happy's setup helper to
 create HappySandboxOffline, HappySandboxOnline and HappySandboxUsers and apply
-Happy-scoped ACL/network rules. A failed or cancelled attempt is retained; repeated
+Happy-scoped ACL/network rules. It also creates HappySandboxOfflineX,
+HappySandboxOnlineX and HappySandboxUsersExternal: workspaces outside the
+Windows profile run as these accounts, whose group is permanently denied the
+profile, so switching between inside and outside workspaces never rewrites the
+profile's ACL (see
+[EXTERNAL_SANDBOX_IDENTITY.md](../../happy-agent-supervisor/native/windows/EXTERNAL_SANDBOX_IDENTITY.md)).
+A failed or cancelled attempt is retained; repeated
 commands do not retry UAC. After addressing the reported error,
 `happy-agent sandbox setup --retry` deliberately permits one more attempt.
 
