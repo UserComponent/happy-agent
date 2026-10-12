@@ -1346,6 +1346,9 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
         const workspace =
             workspaceId === undefined ? undefined : await this.#workspaces.get(ctx, workspaceId);
         const snapshot = await this.#git.snapshot(root.root, undefined, undefined, {
+            ...(workspace?.comparisonBase === undefined
+                ? {}
+                : { comparisonBase: workspace.comparisonBase }),
             ...(workspace?.baseRef === undefined ? {} : { recordedBaseRef: workspace.baseRef }),
             ...(workspace?.baseCommit === undefined
                 ? {}
@@ -2545,8 +2548,11 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                 : this.#gitSummary(agentId, {
                       path: cwd,
                       projectId: owner.project.id,
-                      // The same entity the workspace API tracks: one without the recorded base
-                      // would be measured against the default branch and replace that tracker.
+                      // The same entity the workspace API tracks: one without the chosen or
+                      // recorded base would be measured against another branch and replace it.
+                      ...(owner.comparisonBase === undefined
+                          ? {}
+                          : { comparisonBase: owner.comparisonBase }),
                       ...(owner.baseRef === undefined ? {} : { recordedBaseRef: owner.baseRef }),
                       ...(owner.baseCommit === undefined
                           ? {}
@@ -2670,6 +2676,8 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
         baseRef?: string;
         /** The commit the agent's workspace was created at. */
         baseCommit?: string;
+        /** The branch a person chose to compare the agent's workspace with. */
+        comparisonBase?: string;
         gitBranch?: string;
         project?: { id: string; kind: "home" | "regular"; name: string };
         workspace?: { id: string; name: string };
@@ -2699,6 +2707,9 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                         ...(workspace.baseCommit === undefined
                             ? {}
                             : { baseCommit: workspace.baseCommit }),
+                        ...(workspace.comparisonBase === undefined
+                            ? {}
+                            : { comparisonBase: workspace.comparisonBase }),
                         ...(workspace.branch === undefined ? {} : { gitBranch: workspace.branch }),
                         ...(project === undefined
                             ? {}
