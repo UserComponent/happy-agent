@@ -1297,6 +1297,25 @@ index 41b33b6..358d87f 100644
 +        );
      }
  }
+diff --git a/codex-rs/windows-sandbox-rs/src/deny_read_state.rs b/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
+index fd073a4..76cf0cd 100644
+--- a/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
++++ b/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
+@@ -67,6 +67,14 @@ pub unsafe fn sync_persistent_deny_read_acls(
+     Ok(applied_paths)
+ }
+ 
++/// The persisted deny-read state exactly as stored, or `None` when there is none (Happy).
++///
++/// Every reconciliation rewrites the file deterministically, so equal bytes mean no setup has
++/// changed any principal's deny set since they were read.
++pub(crate) fn deny_read_state_fingerprint(codex_home: &Path) -> Option<Vec<u8>> {
++    std::fs::read(sandbox_dir(codex_home).join(DENY_READ_ACL_STATE_FILE)).ok()
++}
++
+ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
+     match std::fs::read(path) {
+         Ok(bytes) => serde_json::from_slice(&bytes)
 diff --git a/codex-rs/windows-sandbox-rs/src/desktop.rs b/codex-rs/windows-sandbox-rs/src/desktop.rs
 index d8e7d19..7d55a5a 100644
 --- a/codex-rs/windows-sandbox-rs/src/desktop.rs
@@ -2237,7 +2256,7 @@ index 6f3a66d..ab723fb 100644
      fn remove_sandbox_users_file_deletes_existing_file() {
          let codex_home = TempDir::new().expect("tempdir");
 diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
-index e83a42a..4e31ab2 100644
+index e83a42a..e3dd69f 100644
 --- a/codex-rs/windows-sandbox-rs/src/lib.rs
 +++ b/codex-rs/windows-sandbox-rs/src/lib.rs
 @@ -79,6 +79,8 @@ mod hide_users;
@@ -2286,10 +2305,12 @@ index e83a42a..4e31ab2 100644
  pub use setup::run_setup_refresh;
  #[cfg(target_os = "windows")]
  pub use setup::run_setup_refresh_with_extra_read_roots;
-@@ -392,6 +410,10 @@ pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_prof
+@@ -392,6 +410,12 @@ pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_prof
  #[cfg(target_os = "windows")]
  pub use unified_exec::spawn_windows_sandbox_session_for_level;
  #[cfg(target_os = "windows")]
++pub use unified_exec::ServedRunnerDenyRead;
++#[cfg(target_os = "windows")]
 +pub use unified_exec::WindowsSandboxServedRunner;
 +#[cfg(target_os = "windows")]
 +pub use unified_exec::spawn_windows_sandbox_served_runner;
@@ -2846,7 +2867,7 @@ index c13632b..fd68932 100644
 +    Ok(())
 +}
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
-index 0d7d2ca..023df38 100644
+index 0d7d2ca..3fe46a0 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
 +++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
 @@ -24,7 +24,6 @@ use codex_utils_pty::SpawnedProcess;
@@ -2892,7 +2913,7 @@ index 0d7d2ca..023df38 100644
      };
      let (exit_tx, exit_rx) = oneshot::channel::<i32>();
  
-@@ -277,6 +278,106 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
+@@ -277,6 +278,189 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
      ))
  }
  
@@ -2900,12 +2921,61 @@ index 0d7d2ca..023df38 100644
 +///
 +/// The setup refresh, the logon, and the private desktop happen once here instead of once per
 +/// command. Send each command as a `SpawnRequest` cloned from `template` with its own `command`
-+/// and `timeout_ms`, then read frames until its `Exit` or `Error`. Dropping the pipes ends the
-+/// runner and every command it is still running.
++/// and `timeout_ms`, then read frames until its `Exit` or `Error`. Call
++/// `deny_read.ensure_current()` before sending each one. Dropping the pipes ends the runner and
++/// every command it is still running.
 +pub struct WindowsSandboxServedRunner {
 +    pub pipe_write: std::fs::File,
 +    pub pipe_read: std::fs::File,
 +    pub template: SpawnRequest,
++    pub deny_read: ServedRunnerDenyRead,
++}
++
++/// Keeps a served runner's deny-read ACLs in force between its commands (Happy).
++///
++/// Deny-read ACEs belong to the sandbox group, not to one runner, and every setup reconciles the
++/// group's persisted set to its own request: it applies its paths and revokes the rest. A one-shot
++/// command runs that reconciliation right before it starts. A served runner runs it once, so
++/// another workspace's setup can revoke a deny this runner's commands rely on, such as the user
++/// profile denied to a workspace outside it, and the runner would go on without it. Before each
++/// command, `ensure_current` compares the persisted state with what this runner last left there
++/// and repeats the runner's own setup refresh when it changed. That restores the guarantee a
++/// one-shot command has: its deny set was in force when it started.
++pub struct ServedRunnerDenyRead {
++    fingerprint: Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>,
++    refresh: Box<dyn Fn() -> Result<()> + Send + Sync>,
++    current: std::sync::Mutex<Option<Vec<u8>>>,
++}
++
++impl ServedRunnerDenyRead {
++    /// Starts from the state the runner's own setup refresh just left.
++    pub(crate) fn new(
++        fingerprint: Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>,
++        refresh: Box<dyn Fn() -> Result<()> + Send + Sync>,
++    ) -> Self {
++        let current = std::sync::Mutex::new(fingerprint());
++        Self {
++            fingerprint,
++            refresh,
++            current,
++        }
++    }
++
++    /// Re-applies this runner's deny set if another setup changed the persisted one since this
++    /// runner last applied it, and returns whether it had to. After an error the next call tries
++    /// again, and the caller must not start the command.
++    pub fn ensure_current(&self) -> Result<bool> {
++        let mut current = self
++            .current
++            .lock()
++            .map_err(|_| anyhow::anyhow!("deny-read state lock poisoned"))?;
++        if (self.fingerprint)() == *current {
++            return Ok(false);
++        }
++        (self.refresh)()?;
++        *current = (self.fingerprint)();
++        Ok(true)
++    }
 +}
 +
 +#[allow(clippy::too_many_arguments)]
@@ -2937,6 +3007,34 @@ index 0d7d2ca..023df38 100644
 +            workspace_roots,
 +        )?;
 +    let proxy_settings_mode = crate::WindowsSandboxProxySettingsMode::Reconcile;
++    let refresh = {
++        let permissions = permissions.clone();
++        let codex_home = codex_home.to_path_buf();
++        let cwd = cwd.to_path_buf();
++        let env_map = env_map.clone();
++        let command = command.clone();
++        let read_roots_override = read_roots_override.map(<[PathBuf]>::to_vec);
++        let write_roots_override = write_roots_override.map(<[PathBuf]>::to_vec);
++        let deny_read_paths_override = deny_read_paths_override.clone();
++        let deny_write_paths_override = deny_write_paths_override.clone();
++        move || -> Result<()> {
++            prepare_elevated_spawn_context_for_permissions(
++                permissions.clone(),
++                &codex_home,
++                &cwd,
++                &mut env_map.clone(),
++                &command,
++                read_roots_override.as_deref(),
++                read_roots_include_platform_defaults,
++                write_roots_override.as_deref(),
++                &deny_read_paths_override,
++                &deny_write_paths_override,
++                /*proxy_enforced*/ false,
++                proxy_settings_mode,
++            )
++            .map(|_| ())
++        }
++    };
 +    let elevated = prepare_elevated_spawn_context_for_permissions(
 +        permissions.clone(),
 +        codex_home,
@@ -2989,16 +3087,82 @@ index 0d7d2ca..023df38 100644
 +        ..template
 +    };
 +    let (pipe_write, pipe_read) = transport.into_files();
++    let state_home = codex_home.to_path_buf();
++    let deny_read = ServedRunnerDenyRead::new(
++        Box::new(move || crate::deny_read_state::deny_read_state_fingerprint(&state_home)),
++        Box::new(refresh),
++    );
 +    Ok(WindowsSandboxServedRunner {
 +        pipe_write,
 +        pipe_read,
 +        template,
++        deny_read,
 +    })
 +}
 +
  #[cfg(test)]
  #[path = "elevated_tests.rs"]
  mod tests;
+diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
+index e802510..dca99fb 100644
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated_tests.rs
+@@ -192,3 +192,54 @@ fn retry_uses_original_unified_exec_request_and_stops_after_second_failure() {
+     );
+     assert_eq!(vec![expected_refresh], *refresh_observations.borrow());
+ }
++
++#[test]
++fn served_runner_reapplies_its_deny_set_only_after_another_setup_changed_it() {
++    use super::ServedRunnerDenyRead;
++    use std::sync::Arc;
++    use std::sync::Mutex;
++    use std::sync::atomic::AtomicUsize;
++    use std::sync::atomic::Ordering;
++
++    // The persisted state as this runner's own setup left it.
++    let state = Arc::new(Mutex::new(Some(b"profile denied".to_vec())));
++    let refreshes = Arc::new(AtomicUsize::new(0));
++    let fail = Arc::new(Mutex::new(false));
++    let deny_read = {
++        let state = Arc::clone(&state);
++        let refresh_state = Arc::clone(&state);
++        let refreshes = Arc::clone(&refreshes);
++        let fail = Arc::clone(&fail);
++        ServedRunnerDenyRead::new(
++            Box::new(move || state.lock().unwrap().clone()),
++            Box::new(move || {
++                if *fail.lock().unwrap() {
++                    anyhow::bail!("setup refresh failed");
++                }
++                refreshes.fetch_add(1, Ordering::SeqCst);
++                *refresh_state.lock().unwrap() = Some(b"profile denied".to_vec());
++                Ok(())
++            }),
++        )
++    };
++
++    // Nothing changed: commands start without another setup refresh.
++    assert_eq!(false, deny_read.ensure_current().unwrap());
++    assert_eq!(false, deny_read.ensure_current().unwrap());
++    assert_eq!(0, refreshes.load(Ordering::SeqCst));
++
++    // Another workspace's setup revoked the profile deny.
++    *state.lock().unwrap() = Some(b"profile allowed".to_vec());
++    assert_eq!(true, deny_read.ensure_current().unwrap());
++    assert_eq!(1, refreshes.load(Ordering::SeqCst));
++    assert_eq!(false, deny_read.ensure_current().unwrap());
++
++    // A refresh that fails leaves the runner stale, so the command must not start and the next
++    // command tries again.
++    *state.lock().unwrap() = None;
++    *fail.lock().unwrap() = true;
++    assert!(deny_read.ensure_current().is_err());
++    *fail.lock().unwrap() = false;
++    assert_eq!(true, deny_read.ensure_current().unwrap());
++    assert_eq!(2, refreshes.load(Ordering::SeqCst));
++}
+\ No newline at end of file
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs
 index f37829e..903e361 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs
@@ -3095,13 +3259,14 @@ index f37829e..903e361 100644
      }
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs
-index 4e6020a..cebb2dc 100644
+index 4e6020a..9e160fb 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs
 +++ b/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs
-@@ -97,6 +97,37 @@ pub async fn spawn_windows_sandbox_session_for_level(
+@@ -97,6 +97,38 @@ pub async fn spawn_windows_sandbox_session_for_level(
      }
  }
  
++pub use backends::elevated::ServedRunnerDenyRead;
 +pub use backends::elevated::WindowsSandboxServedRunner;
 +
 +/// Starts one elevated runner that serves many pipe commands without a terminal (Happy).

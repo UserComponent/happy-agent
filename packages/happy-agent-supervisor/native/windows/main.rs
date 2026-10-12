@@ -65,9 +65,10 @@ fn send_frame(pipe:&Mutex<Option<std::fs::File>>, id:u64, keep_descendants:bool,
 ///
 /// The worker pays once for what every sandboxed command used to pay: the setup refresh, the
 /// sandbox logon, the private desktop, and the scratch directory. Each command still runs under
-/// its own restricted token and job. Closing stdin ends the running command and the worker.
+/// its own restricted token and job, and starts only once the worker's deny-read ACLs are back in
+/// force if another setup changed them. Closing stdin ends the running command and the worker.
 fn serve_worker(runner: WindowsSandboxServedRunner) -> Result<i32> {
-    let WindowsSandboxServedRunner {pipe_write, mut pipe_read, template}=runner;
+    let WindowsSandboxServedRunner {pipe_write, mut pipe_read, template, deny_read}=runner;
     let pipe_write=Arc::new(Mutex::new(Some(pipe_write)));
     let current=Arc::new(Mutex::new(None::<u64>));
     let (runs, queued)=mpsc::channel::<(u64,Vec<String>,Option<u64>)>();
@@ -95,6 +96,10 @@ fn serve_worker(runner: WindowsSandboxServedRunner) -> Result<i32> {
     }
     emit(json!({"type":"ready"}))?;
     for (id,argv,timeout_ms) in queued {
+        if let Err(err)=deny_read.ensure_current() {
+            emit(json!({"type":"error","id":id,"message":format!("The sandbox could not restore its read restrictions: {err:#}")}))?;
+            continue;
+        }
         *current.lock().map_err(|_| anyhow::anyhow!("worker state lock poisoned"))?=Some(id);
         send_frame(&pipe_write,id,false,Message::SpawnRequest {payload:Box::new(codex_windows_sandbox::SpawnRequest {command:argv,timeout_ms,..template.clone()})})?;
         loop {
@@ -160,18 +165,21 @@ impl ShellRunnerEnvironment {
 /// desktop. Unlike it, commands run concurrently, may have a terminal and input, and bring their
 /// complete environment with every request. Each command gets its own restricted token, job, and
 /// scratch folder, which is deleted when the command ends. Commands are told apart by the id the
-/// daemon gives them. If the sandboxed runner dies, every running command gets an error and this
-/// process exits; closing stdin stops every command and then this process.
+/// daemon gives them. Before a command starts, the runner's deny-read ACLs are put back in force
+/// if another setup changed them; that may take a setup refresh, so it happens on the command's own
+/// thread, and input for the command waits until it has been sent. If the sandboxed runner dies,
+/// every running command gets an error and this process exits; closing stdin stops every command
+/// and then this process.
 fn serve_shell_runner(runner: WindowsSandboxServedRunner, environment: ShellRunnerEnvironment) -> Result<i32> {
-    let WindowsSandboxServedRunner {pipe_write, mut pipe_read, template}=runner;
-    let pipe_write=Arc::new(Mutex::new(Some(pipe_write)));
-    // Every command that has been sent and has not yet ended, with its scratch folder.
-    let running=Arc::new(Mutex::new(HashMap::<u64,PathBuf>::new()));
-    let environment=Arc::new(environment);
+    let WindowsSandboxServedRunner {pipe_write, mut pipe_read, template, deny_read}=runner;
+    let shared=Arc::new(ShellRunnerShared {
+        pipe_write:Mutex::new(Some(pipe_write)),
+        running:Mutex::new(HashMap::new()),
+        pending:Mutex::new(HashMap::new()),
+        environment, template, deny_read,
+    });
     {
-        let pipe_write=Arc::clone(&pipe_write);
-        let running=Arc::clone(&running);
-        let environment=Arc::clone(&environment);
+        let shared=Arc::clone(&shared);
         std::thread::spawn(move || {
             for line in std::io::stdin().lock().lines() {
                 let Ok(line)=line else {break};
@@ -182,7 +190,7 @@ fn serve_shell_runner(runner: WindowsSandboxServedRunner, environment: ShellRunn
                 };
                 let (id,message)=match request {
                     ShellRunnerRequest::Run {id,argv,env,tty,timeout_ms} => {
-                        if let Err(err)=start_shell_command(&pipe_write,&running,&environment,&template,id,argv,env,tty,timeout_ms) {
+                        if let Err(err)=start_shell_command(&shared,id,argv,env,tty,timeout_ms) {
                             let _=emit(json!({"type":"error","id":id,"message":format!("{err:#}")}));
                         }
                         continue;
@@ -192,10 +200,15 @@ fn serve_shell_runner(runner: WindowsSandboxServedRunner, environment: ShellRunn
                     ShellRunnerRequest::Resize {id,rows,cols} => (id,Message::Resize {payload:codex_windows_sandbox::ResizePayload {rows,cols}}),
                     ShellRunnerRequest::Terminate {id} => (id,Message::Terminate {payload:Default::default()}),
                 };
-                let _=send_frame(&pipe_write,id,false,message);
+                // A command still waiting to be sent keeps its input in order until it is.
+                let Ok(mut pending)=shared.pending.lock() else {break};
+                match pending.get_mut(&id) {
+                    Some(queued) => queued.push(message),
+                    None => {let _=send_frame(&shared.pipe_write,id,false,message);}
+                }
             }
             // Closing the pipe tells the sandboxed runner to stop everything and exit.
-            if let Ok(mut pipe)=pipe_write.lock() {pipe.take();}
+            if let Ok(mut pipe)=shared.pipe_write.lock() {pipe.take();}
         });
     }
     emit(json!({"type":"ready"}))?;
@@ -209,53 +222,81 @@ fn serve_shell_runner(runner: WindowsSandboxServedRunner, environment: ShellRunn
             Message::SpawnReady {payload} => emit(json!({"type":"spawned","id":id,"pid":payload.process_id}))?,
             Message::Output {payload} => emit(json!({"type":payload.stream,"id":id,"data":payload.data_b64}))?,
             Message::Exit {payload} => {
-                finish_shell_command(&running,id);
+                finish_shell_command(&shared.running,id);
                 emit(json!({"type":"exit","id":id,"code":payload.exit_code,"timedOut":payload.timed_out}))?;
             }
             Message::Error {payload} => {
-                finish_shell_command(&running,id);
+                finish_shell_command(&shared.running,id);
                 emit(json!({"type":"error","id":id,"message":payload.message}))?;
             }
             _ => {}
         }
     }
     // The runner is gone, and every command it was running went with it.
-    let orphaned:Vec<u64>=running.lock().map(|running| running.keys().copied().collect()).unwrap_or_default();
+    let orphaned:Vec<u64>=shared.running.lock().map(|running| running.keys().copied().collect()).unwrap_or_default();
     for id in orphaned {
-        finish_shell_command(&running,id);
-        emit(json!({"type":"error","id":id,"message":"The sandbox runner stopped, so this command was stopped too."}))?;
+        if finish_shell_command(&shared.running,id) {
+            emit(json!({"type":"error","id":id,"message":"The sandbox runner stopped, so this command was stopped too."}))?;
+        }
     }
-    let closed=pipe_write.lock().map(|pipe| pipe.is_none()).unwrap_or(false);
+    let closed=shared.pipe_write.lock().map(|pipe| pipe.is_none()).unwrap_or(false);
     Ok(if closed {0} else {1})
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What every thread of a shell runner shares.
+struct ShellRunnerShared {
+    pipe_write: Mutex<Option<std::fs::File>>,
+    /// Every command that has been accepted and has not yet ended, with its scratch folder.
+    running: Mutex<HashMap<u64,PathBuf>>,
+    /// Commands not yet sent to the sandboxed runner, with the input that arrived for them meanwhile.
+    pending: Mutex<HashMap<u64,Vec<Message>>>,
+    environment: ShellRunnerEnvironment,
+    template: codex_windows_sandbox::SpawnRequest,
+    deny_read: codex_windows_sandbox::ServedRunnerDenyRead,
+}
+
 fn start_shell_command(
-    pipe_write:&Mutex<Option<std::fs::File>>, running:&Mutex<HashMap<u64,PathBuf>>, environment:&ShellRunnerEnvironment,
-    template:&codex_windows_sandbox::SpawnRequest, id:u64, argv:Vec<String>, env:HashMap<String,String>, tty:bool, timeout_ms:Option<u64>,
+    shared:&Arc<ShellRunnerShared>, id:u64, argv:Vec<String>, env:HashMap<String,String>, tty:bool, timeout_ms:Option<u64>,
 ) -> Result<()> {
     if argv.is_empty() {bail!("missing command")}
-    let scratch=environment.scratch.join(format!("command-{id}"));
+    let scratch=shared.environment.scratch.join(format!("command-{id}"));
     {
-        let mut running=running.lock().map_err(|_| anyhow::anyhow!("runner state lock poisoned"))?;
+        let mut running=shared.running.lock().map_err(|_| anyhow::anyhow!("runner state lock poisoned"))?;
         if running.contains_key(&id) {bail!("command {id} is already running")}
         std::fs::create_dir(&scratch).context("create the command's scratch folder")?;
         running.insert(id,scratch.clone());
     }
+    shared.pending.lock().map_err(|_| anyhow::anyhow!("runner state lock poisoned"))?.insert(id,Vec::new());
     let request=codex_windows_sandbox::SpawnRequest {
-        command:argv, env:environment.command_env(env,&scratch), timeout_ms, tty, stdin_open:true, ..template.clone()
+        command:argv, env:shared.environment.command_env(env,&scratch), timeout_ms, tty, stdin_open:true, ..shared.template.clone()
     };
-    if let Err(err)=send_frame(pipe_write,id,true,Message::SpawnRequest {payload:Box::new(request)}) {
-        finish_shell_command(running,id);
-        return Err(err);
-    }
+    let shared=Arc::clone(shared);
+    std::thread::spawn(move || {
+        let sent=shared.deny_read.ensure_current()
+            .context("The sandbox could not restore its read restrictions, so the command was not started")
+            .and_then(|_| {
+                let mut pending=shared.pending.lock().map_err(|_| anyhow::anyhow!("runner state lock poisoned"))?;
+                let queued=pending.remove(&id).unwrap_or_default();
+                send_frame(&shared.pipe_write,id,true,Message::SpawnRequest {payload:Box::new(request)})?;
+                for message in queued {send_frame(&shared.pipe_write,id,false,message)?;}
+                Ok(())
+            });
+        if let Err(err)=sent {
+            if let Ok(mut pending)=shared.pending.lock() {pending.remove(&id);}
+            if finish_shell_command(&shared.running,id) {
+                let _=emit(json!({"type":"error","id":id,"message":format!("{err:#}")}));
+            }
+        }
+    });
     Ok(())
 }
 
-/// Forgets a command that ended and deletes its scratch folder.
-fn finish_shell_command(running:&Mutex<HashMap<u64,PathBuf>>, id:u64) {
+/// Forgets a command that ended and deletes its scratch folder; false if it was already forgotten.
+fn finish_shell_command(running:&Mutex<HashMap<u64,PathBuf>>, id:u64) -> bool {
     let scratch=running.lock().ok().and_then(|mut running| running.remove(&id));
+    let known=scratch.is_some();
     if let Some(scratch)=scratch {let _=std::fs::remove_dir_all(scratch);}
+    known
 }
 
 async fn run() -> Result<i32> {
