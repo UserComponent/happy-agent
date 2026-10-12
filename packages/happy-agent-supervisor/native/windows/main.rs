@@ -173,7 +173,35 @@ async fn run() -> Result<i32> {
     Ok(forward_sandbox_session_stdio(spawned).await)
 }
 
+/// Ties every process this supervisor starts to the supervisor's own lifetime.
+///
+/// The caller stops a supervisor by killing it, for example when a worker's sandbox setup does
+/// not finish in time. A setup helper started before that kill would otherwise keep running with
+/// no parent, and a caller that retries starts another one each time. Children join this job when
+/// they are created, and closing its last handle, which happens however the supervisor exits,
+/// kills them. A UAC-elevated setup is started by the shell outside any job and is unaffected.
+fn kill_children_with_supervisor() {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let job=CreateJobObjectW(std::ptr::null(),std::ptr::null());
+        if job==0 {return}
+        let mut limits:JOBOBJECT_EXTENDED_LIMIT_INFORMATION=std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured=SetInformationJobObject(job,JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+        // The handle is deliberately never closed: the process exit closes it.
+        if configured!=0 {AssignProcessToJobObject(job,GetCurrentProcess());}
+    }
+}
+
 fn main() {
+    kill_children_with_supervisor();
     let outcome = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => {
             let outcome = runtime.block_on(run());
