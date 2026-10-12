@@ -28,6 +28,19 @@ A typed "why unavailable" field for clients was proposed alongside this and drop
 fallbacks the only cause left is a failed Git read, which a client's "temporarily unavailable"
 message already describes correctly, so the protocol did not change.
 
+## Every caller tracks a workspace with the same comparison preferences
+
+A worktree cut from origin/release-v8.8 showed its whole distance from origin/main as changes,
+although the workspace recorded release-v8.8 as its base. The workspace API tracked it with that
+recorded base, but the Happy session list tracked the same workspace without it. The tracker is
+keyed by workspace and replaces itself whenever the entity differs, so the session list's
+renewals kept winning and also forced a rescan each time the two alternated.
+
+Whoever builds a tracked entity or asks for a snapshot of a workspace passes the workspace's
+recorded aseRef (and, once it exists, its chosen comparison branch). The comparison follows
+the merge base with that branch, so commits that land on the branch later never count as this
+workspace's changes. Heuristics that guess a branch are only for folders with no recorded base.
+
 ## A missing revision is not a missing file
 
 Git's path lookup can say a file does not exist in an object even when that object itself is
