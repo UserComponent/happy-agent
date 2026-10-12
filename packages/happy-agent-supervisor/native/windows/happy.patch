@@ -1013,7 +1013,7 @@ index 2624607..40189d0 100644
 +    panic!("happy-sandbox-setup is Windows-only");
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
-index f80efe4..b9cc041 100644
+index f80efe4..51f4205 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
 +++ b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
 @@ -46,11 +46,8 @@ use std::ffi::OsStr;
@@ -1122,7 +1122,7 @@ index f80efe4..b9cc041 100644
          for username in [&payload.offline_username, &payload.online_username] {
              let flags = local_user_flags(username)?.ok_or_else(|| {
                  anyhow::anyhow!("sandbox user {username} disappeared during repair")
-@@ -872,7 +860,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
+@@ -872,7 +860,21 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
  
      // Deny-read ACEs must be present before the sandboxed command starts. Apply
      // them synchronously here instead of delegating them to the background
@@ -1133,10 +1133,19 @@ index f80efe4..b9cc041 100644
 +    // applied. The lock is re-entrant for this thread, so the read-grant step
 +    // below takes it again without waiting.
 +    let deny_read_guard = acquire_read_acl_mutex().context("acquire deny-read ACL lock")?;
++    // Happy: adding or revoking a deny on a large folder rewrites everything below it while this
++    // helper holds the lock, so record when that work begins.
++    log_line(
++        log,
++        &format!(
++            "reconciling deny-read ACLs for {} paths",
++            payload.deny_read_paths.len()
++        ),
++    )?;
      let applied_deny_read_paths = unsafe {
          sync_persistent_deny_read_acls(
              &payload.codex_home,
-@@ -889,45 +882,14 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
+@@ -889,45 +891,14 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
          )?;
      }
  
@@ -1189,7 +1198,7 @@ index f80efe4..b9cc041 100644
  
      let mut grant_tasks: Vec<(PathBuf, String)> = Vec::new();
  
-@@ -1090,7 +1052,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
+@@ -1090,7 +1061,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
          log_line(
              log,
              &format!(
@@ -1198,7 +1207,7 @@ index f80efe4..b9cc041 100644
                  payload.write_roots.len(),
                  refresh_errors
              ),
-@@ -1144,8 +1106,8 @@ mod tests {
+@@ -1144,8 +1115,8 @@ mod tests {
      fn payload_json() -> serde_json::Value {
          json!({
              "version": SETUP_VERSION,
@@ -1238,10 +1247,10 @@ index bf2476d..4608f9a 100644
  const NON_LOOPBACK_REMOTE_ADDRESSES: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
  
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/read_acl_mutex.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/read_acl_mutex.rs
-index a96b6a5..3ca29b0 100644
+index a96b6a5..926641c 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/read_acl_mutex.rs
 +++ b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/read_acl_mutex.rs
-@@ -1,61 +1,28 @@
+@@ -1,61 +1,37 @@
  use anyhow::Result;
  use codex_windows_sandbox::to_wide;
  use std::ffi::OsStr;
@@ -1254,7 +1263,7 @@ index a96b6a5..3ca29b0 100644
 -use windows_sys::Win32::System::Threading::MUTEX_ALL_ACCESS;
 -use windows_sys::Win32::System::Threading::OpenMutexW;
 -use windows_sys::Win32::System::Threading::ReleaseMutex;
-+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
++use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 +use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
  
 -const READ_ACL_MUTEX_NAME: &str = "Local\\CodexSandboxReadAcl";
@@ -1304,14 +1313,22 @@ index a96b6a5..3ca29b0 100644
 -    if err == ERROR_ALREADY_EXISTS {
 -        unsafe {
 -            CloseHandle(handle);
--        }
--        return Ok(None);
 +    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
 +    if handle == 0 { return Err(anyhow::anyhow!("CreateMutexW failed: {}", unsafe { GetLastError() })); }
 +    let outcome = unsafe { WaitForSingleObject(handle, 30_000) };
 +    if outcome != WAIT_OBJECT_0 && outcome != WAIT_ABANDONED {
++        // Happy: read the error before closing the handle, and only when the wait failed; after
++        // a timeout it would be the stale ERROR_ALREADY_EXISTS left by CreateMutexW.
 +        let error = unsafe { GetLastError() };
 +        unsafe { CloseHandle(handle); }
++        if outcome == WAIT_TIMEOUT {
++            return Err(anyhow::anyhow!(
++                "Another Happy sandbox setup is still updating folder permissions. Changing a large \
++                 folder such as the user profile can take many minutes; this sandbox starts once \
++                 it finishes."
++            ));
+         }
+-        return Ok(None);
 +        return Err(anyhow::anyhow!("Could not acquire Happy project ACL lock: wait={outcome}, error={error}"));
      }
 -    Ok(Some(ReadAclMutexGuard { handle }))
@@ -1500,19 +1517,20 @@ index 41b33b6..358d87f 100644
      }
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/deny_read_state.rs b/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
-index fd073a4..009f76f 100644
+index fd073a4..0b22b74 100644
 --- a/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
 +++ b/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,9 @@
 +use crate::acl::path_has_explicit_deny_read_for_sid;
  use crate::acl::revoke_ace;
  use crate::deny_read_acl::apply_deny_read_acls;
  use crate::deny_read_acl::lexical_path_key;
 +use crate::deny_read_acl::plan_deny_read_acl_paths;
++use crate::logging::log_note;
  use crate::setup::sandbox_dir;
  use anyhow::Context;
  use anyhow::Result;
-@@ -27,6 +29,13 @@ struct PersistentDenyReadAclState {
+@@ -27,6 +30,13 @@ struct PersistentDenyReadAclState {
  /// each SID, apply the new desired set first, and only then revoke stale paths
  /// from the same SID so profile changes do not leave old deny-read ACEs behind.
  ///
@@ -1526,7 +1544,7 @@ index fd073a4..009f76f 100644
  /// # Safety
  /// Caller must pass a valid SID pointer matching `principal_sid`.
  pub unsafe fn sync_persistent_deny_read_acls(
-@@ -34,6 +43,29 @@ pub unsafe fn sync_persistent_deny_read_acls(
+@@ -34,6 +44,29 @@ pub unsafe fn sync_persistent_deny_read_acls(
      principal_sid: &str,
      desired_paths: &[PathBuf],
      psid: *mut c_void,
@@ -1556,7 +1574,7 @@ index fd073a4..009f76f 100644
  ) -> Result<Vec<PathBuf>> {
      let state_path = sandbox_dir(codex_home).join(DENY_READ_ACL_STATE_FILE);
      let mut state = load_state(&state_path)?;
-@@ -43,15 +75,39 @@ pub unsafe fn sync_persistent_deny_read_acls(
+@@ -43,15 +76,39 @@ pub unsafe fn sync_persistent_deny_read_acls(
          .cloned()
          .unwrap_or_default();
  
@@ -1582,7 +1600,7 @@ index fd073a4..009f76f 100644
      for path in previous_paths {
          if !desired_keys.contains(&lexical_path_key(&path)) {
 -            revoke_ace(&path, psid);
-+            unsafe { revoke_ace(&path, psid) };
++            unsafe { revoke_logged(codex_home, &path, psid) };
 +        }
 +    }
 +    // Revoking rewrites a whole tree's inherited ACEs, so only a deny that is
@@ -1593,14 +1611,23 @@ index fd073a4..009f76f 100644
 +            && !previous_keys.contains(&key)
 +            && unsafe { path_has_explicit_deny_read_for_sid(path, psid) }
 +        {
-+            unsafe { revoke_ace(path, psid) };
++            unsafe { revoke_logged(codex_home, path, psid) };
          }
      }
  
-@@ -67,6 +123,42 @@ pub unsafe fn sync_persistent_deny_read_acls(
+@@ -67,6 +124,51 @@ pub unsafe fn sync_persistent_deny_read_acls(
      Ok(applied_paths)
  }
  
++/// Revokes one deny this principal no longer wants, noting it in the sandbox log, because on a
++/// large folder it rewrites everything below and can take many minutes (Happy).
++unsafe fn revoke_logged(codex_home: &Path, path: &Path, psid: *mut c_void) {
++    let log_dir = sandbox_dir(codex_home);
++    log_note(&format!("revoking deny-read ACE on {}", path.display()), Some(&log_dir));
++    unsafe { revoke_ace(path, psid) };
++    log_note(&format!("revoked deny-read ACE on {}", path.display()), Some(&log_dir));
++}
++
 +/// The recorded paths followed by every planned path they do not already hold.
 +fn with_intended_paths(previous: &[PathBuf], planned: &[PathBuf]) -> Vec<PathBuf> {
 +    let mut keys = previous
@@ -1640,7 +1667,7 @@ index fd073a4..009f76f 100644
  fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
      match std::fs::read(path) {
          Ok(bytes) => serde_json::from_slice(&bytes)
-@@ -80,8 +172,138 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
+@@ -80,8 +182,138 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
      }
  }
  
@@ -2885,7 +2912,7 @@ index f2524fa..4365444 100644
  /// Versioned provisioning-service message carried in a length-prefixed JSON frame.
  #[derive(Debug, Serialize, Deserialize, Clone)]
 diff --git a/codex-rs/windows-sandbox-rs/src/setup.rs b/codex-rs/windows-sandbox-rs/src/setup.rs
-index 1e84b6f..1e55468 100644
+index 1e84b6f..355d9d3 100644
 --- a/codex-rs/windows-sandbox-rs/src/setup.rs
 +++ b/codex-rs/windows-sandbox-rs/src/setup.rs
 @@ -33,6 +33,8 @@ use crate::setup_error::extract_failure;
@@ -2926,7 +2953,152 @@ index 1e84b6f..1e55468 100644
          mode: SetupMode::Full,
          refresh_only: true,
      };
-@@ -949,20 +953,19 @@ fn run_setup_exe_payload(
+@@ -389,7 +393,7 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+         ),
+         Some(&sbx_dir),
+     );
+-    let status = cmd.status().map_err(|err| {
++    let status = spawn_outliving_caller(&mut cmd).and_then(|mut child| child.wait()).map_err(|err| {
+         let message = format!(
+             "setup refresh failed to launch helper: helper={}, cwd={}, log={}, error={err}",
+             exe.display(),
+@@ -419,6 +423,135 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Starts a refresh helper outside the job of the process that asked for it (Happy).
++///
++/// Adding or revoking a deny-read ACE on a large folder such as the user profile rewrites the
++/// inherited ACEs of everything below it, which can take longer than any caller waits. A helper
++/// in the supervisor's kill-on-close job was killed with the supervisor part-way through, and the
++/// next command started the same rewrite again from the beginning, so it never finished. Outside
++/// the job it runs to completion. Only the helper holding the read-ACL lock keeps working; every
++/// other one gives up within the lock wait, so at most one outlives its caller for long.
++fn spawn_outliving_caller(cmd: &mut Command) -> std::io::Result<std::process::Child> {
++    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
++    const ERROR_ACCESS_DENIED: i32 = 5;
++    match cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB).spawn() {
++        // A job that does not permit breakaway refuses the flag; stay in it rather than fail.
++        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
++            cmd.creation_flags(0).spawn()
++        }
++        result => result,
++    }
++}
++
++#[cfg(test)]
++mod breakaway_tests {
++    use super::spawn_outliving_caller;
++    use std::ffi::c_void;
++    use std::io::BufRead;
++    use std::io::BufReader;
++    use std::io::Write;
++    use std::os::windows::io::AsRawHandle;
++    use std::process::Command;
++    use std::process::Stdio;
++    use windows_sys::Win32::Foundation::CloseHandle;
++    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
++    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
++    use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
++    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
++    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++    use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
++    use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
++    use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
++    use windows_sys::Win32::System::Threading::OpenProcess;
++    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
++    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
++    use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
++    use windows_sys::Win32::System::Threading::TerminateProcess;
++    use windows_sys::Win32::System::Threading::WaitForSingleObject;
++
++    const CALLER_ENV: &str = "HAPPY_TEST_OUTLIVING_CALLER";
++
++    /// The caller in `a_refresh_helper_outlives_its_callers_kill_on_close_job`; it does nothing
++    /// unless that test started it inside its job.
++    #[test]
++    #[ignore]
++    fn outliving_caller_child() {
++        if std::env::var_os(CALLER_ENV).is_none() {
++            return;
++        }
++        let mut line = String::new();
++        std::io::stdin().lock().read_line(&mut line).unwrap();
++        let helper = spawn_outliving_caller(
++            Command::new("ping")
++                .args(["-n", "30", "127.0.0.1"])
++                .stdin(Stdio::null())
++                .stdout(Stdio::null())
++                .stderr(Stdio::null()),
++        )
++        .unwrap();
++        println!("helper={}", helper.id());
++        std::io::stdout().flush().unwrap();
++        std::thread::sleep(std::time::Duration::from_secs(60));
++    }
++
++    #[test]
++    fn a_refresh_helper_outlives_its_callers_kill_on_close_job() {
++        unsafe {
++            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
++            assert_ne!(job, 0);
++            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
++            limits.BasicLimitInformation.LimitFlags =
++                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
++            assert_ne!(
++                SetInformationJobObject(
++                    job,
++                    JobObjectExtendedLimitInformation,
++                    &limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
++                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
++                ),
++                0
++            );
++            let mut caller = Command::new(std::env::current_exe().unwrap())
++                .args([
++                    "--exact",
++                    "setup::breakaway_tests::outliving_caller_child",
++                    "--ignored",
++                    "--nocapture",
++                    "--test-threads=1",
++                ])
++                .env(CALLER_ENV, "1")
++                .stdin(Stdio::piped())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::null())
++                .spawn()
++                .unwrap();
++            assert_ne!(AssignProcessToJobObject(job, caller.as_raw_handle() as _), 0);
++            caller.stdin.take().unwrap().write_all(b"go\n").unwrap();
++            let helper_pid: u32 = BufReader::new(caller.stdout.take().unwrap())
++                .lines()
++                .map_while(Result::ok)
++                // The harness prints the test's name on the same line, before the output.
++                .find_map(|line| line.split_once("helper=").map(|(_, pid)| pid.trim().parse().unwrap()))
++                .expect("the caller reports its helper");
++
++            // Closing the job's only handle kills the caller, as stopping a supervisor does.
++            CloseHandle(job);
++            caller.wait().unwrap();
++
++            let helper = OpenProcess(
++                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
++                0,
++                helper_pid,
++            );
++            assert_ne!(helper, 0, "the helper was killed with its caller's job");
++            let still_running = WaitForSingleObject(helper, 500) == WAIT_TIMEOUT;
++            TerminateProcess(helper, 1);
++            CloseHandle(helper);
++            assert!(still_running, "the helper was killed with its caller's job");
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct SetupMarker {
+     pub version: u32,
+@@ -949,20 +1082,19 @@ fn run_setup_exe_payload(
      };
  
      if !needs_elevation {
@@ -2949,7 +3121,7 @@ index 1e84b6f..1e55468 100644
          }
          .map_err(|err| {
              failure(
-@@ -970,6 +973,7 @@ fn run_setup_exe_payload(
+@@ -970,6 +1102,7 @@ fn run_setup_exe_payload(
                  format!("failed to launch setup helper (non-elevated): {err}"),
              )
          })?;
@@ -2957,7 +3129,7 @@ index 1e84b6f..1e55468 100644
          if !status.success() {
              return Err(report_helper_failure(
                  codex_home,
-@@ -1004,7 +1008,7 @@ fn run_setup_exe_payload(
+@@ -1004,7 +1137,7 @@ fn run_setup_exe_payload(
      // Hide the window for the elevated helper.
      sei.nShow = 0; // SW_HIDE
      let ok = unsafe { ShellExecuteExW(&mut sei) };
@@ -2966,7 +3138,7 @@ index 1e84b6f..1e55468 100644
          let last_error = unsafe { GetLastError() };
          let code = if last_error == ERROR_CANCELLED {
              SetupErrorCode::OrchestratorHelperLaunchCanceled
-@@ -1016,8 +1020,15 @@ fn run_setup_exe_payload(
+@@ -1016,8 +1149,15 @@ fn run_setup_exe_payload(
              format!("ShellExecuteExW failed to launch setup helper: {last_error}"),
          ));
      }
@@ -2983,7 +3155,7 @@ index 1e84b6f..1e55468 100644
          let mut code: u32 = 1;
          GetExitCodeProcess(sei.hProcess, &mut code);
          CloseHandle(sei.hProcess);
-@@ -1040,48 +1051,83 @@ fn run_setup_exe_payload(
+@@ -1040,48 +1180,83 @@ fn run_setup_exe_payload(
  }
  
  pub fn run_elevated_setup(request: SandboxSetupRequest<'_>) -> Result<()> {
@@ -3084,7 +3256,7 @@ index 1e84b6f..1e55468 100644
          version: SETUP_VERSION,
          offline_username: OFFLINE_USERNAME.to_string(),
          online_username: ONLINE_USERNAME.to_string(),
-@@ -1093,11 +1139,11 @@ fn elevated_provisioning_payload(
+@@ -1093,11 +1268,11 @@ fn elevated_provisioning_payload(
          deny_write_paths: Vec::new(),
          proxy_ports: offline_proxy_settings.proxy_ports,
          allow_local_binding: offline_proxy_settings.allow_local_binding,
@@ -3098,7 +3270,7 @@ index 1e84b6f..1e55468 100644
  }
  
  pub fn run_elevated_provisioning_setup(
-@@ -1600,7 +1646,7 @@ mod tests {
+@@ -1600,7 +1775,7 @@ mod tests {
  
          let payload = super::elevated_provisioning_payload(
              &request, /*offline_proxy_settings_override*/ None,
@@ -3107,7 +3279,7 @@ index 1e84b6f..1e55468 100644
  
          assert_eq!(payload.command_cwd, codex_home);
          assert_eq!(payload.read_roots, Vec::<PathBuf>::new());
-@@ -1870,7 +1916,7 @@ mod tests {
+@@ -1870,7 +2045,7 @@ mod tests {
          fs::create_dir_all(&bin_dir).expect("create bin dir");
          fs::create_dir_all(&resources_dir).expect("create resources dir");
          let exe = bin_dir.join("codex.exe");
