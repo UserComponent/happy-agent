@@ -9,6 +9,7 @@ import {
     GIT_RECONCILE_STALE_AFTER_MS,
     GitStateTracker,
     gitReferenceChangeAffectsSnapshot,
+    type GitRestoredState,
     type GitStateTrackerOwner,
 } from "../../sources/git/impl/GitStateTracker.js";
 import {
@@ -295,6 +296,66 @@ describe("GitStateTracker scheduling", () => {
             expect(scan.diffReads).toBe(1);
         } finally {
             tracker.dispose();
+        }
+    });
+
+    it("starts from the state a previous daemon left and only proves it current", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000);
+        const remembered: GitRestoredState[] = [];
+        const before = testScan();
+        const first = new GitStateTracker(createRootContext(), before.run, {
+            ...owner(),
+            remember: (_entity, state, fingerprint) => {
+                remembered.push({
+                    ...(fingerprint === undefined ? {} : { fingerprint }),
+                    partial: false,
+                    state,
+                });
+            },
+        });
+        await startTracking(first);
+        first.dispose();
+        expect(remembered).toHaveLength(1);
+        expect(remembered[0]!.fingerprint).toBeDefined();
+
+        const scan = testScan();
+        const restarted = new GitStateTracker(createRootContext(), scan.run, {
+            ...owner(),
+            restore: () => remembered[0],
+        });
+        try {
+            restarted.watch(entity);
+            // A reconnecting client is answered before any Git runs.
+            expect(restarted.snapshot(entity)?.facts.head).toBe(HEAD);
+            await settlePromises();
+            await advance(150);
+            // One status read proves the working tree and one merge base proves the base; the
+            // diff is never read again.
+            expect(scan.fullStatusReads).toBe(1);
+            expect(scan.mergeBaseReads).toHaveLength(1);
+            expect(scan.diffReads).toBe(0);
+        } finally {
+            restarted.dispose();
+        }
+    });
+
+    it("scans a restored state in full when it was kept without everything", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000);
+        const scan = testScan();
+        const restarted = new GitStateTracker(createRootContext(), scan.run, {
+            ...owner(),
+            restore: () => ({ fingerprint: "kept", partial: true, state: stampedSnapshot() }),
+        });
+        try {
+            restarted.watch(entity);
+            expect(restarted.snapshot(entity)).toBeDefined();
+            await settlePromises();
+            await advance(150);
+            expect(scan.diffReads).toBe(1);
+        } finally {
+            restarted.dispose();
         }
     });
 
