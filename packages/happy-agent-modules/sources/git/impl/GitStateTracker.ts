@@ -18,7 +18,12 @@ const TRACKED_LIMIT = 256;
 const SCAN_CONCURRENCY = 2;
 const DEBOUNCE_MS = 150;
 const MAXIMUM_DEBOUNCE_MS = 750;
-const RECURSIVE_WATCH_STALE_MS = 2 * 60 * 1000;
+/**
+ * A watched repository is rescanned on its working-tree and Git metadata events, so its stale
+ * check is only a safety net for an event the operating system lost. On Windows each check of a
+ * background workspace would otherwise keep its scan sandbox busy around the clock.
+ */
+const RECURSIVE_WATCH_STALE_MS = 30 * 60 * 1000;
 const POLLING_STALE_MS = 30_000;
 const WORKTREE_PATH_LIMIT = 128;
 const WORKTREE_PATH_BATCH = 64;
@@ -30,7 +35,10 @@ const BACKOFF_LIMIT_MS = 30_000;
  * merge base when the snapshot names its base branch, and otherwise by a full scan.
  */
 const FULL_SCAN_LIMIT_MS = 30 * 60 * 1000;
-/** Each unchanged stale check doubles the wait, up to this many times the starting interval. */
+/**
+ * Each unchanged stale check of a polled repository doubles the wait, up to this many times the
+ * starting interval.
+ */
 const IDLE_RECONCILE_FACTOR = 10;
 
 /** The stale deadline of a repository whose working tree is not delivering events. */
@@ -713,9 +721,11 @@ export class GitStateTracker {
         if (tracker.backoffTimer !== undefined) clearTimeout(tracker.backoffTimer);
         tracker.backoffTimer = undefined;
         const staleAfter = this.#staleAfter(tracker);
-        tracker.reconcileDelayMs = unchanged
-            ? Math.min(staleAfter * IDLE_RECONCILE_FACTOR, tracker.reconcileDelayMs * 2)
-            : staleAfter;
+        // A watched repository's safety net is already long; only polling relaxes further.
+        tracker.reconcileDelayMs =
+            unchanged && !tracker.treeWatching
+                ? Math.min(staleAfter * IDLE_RECONCILE_FACTOR, tracker.reconcileDelayMs * 2)
+                : staleAfter;
         tracker.reconcileAt = tracker.reconcileAfterScan
             ? Date.now()
             : Date.now() + tracker.reconcileDelayMs;
