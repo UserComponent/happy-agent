@@ -472,18 +472,25 @@ async fn run() -> Result<i32> {
 /// no parent, and a caller that retries starts another one each time. Children join this job when
 /// they are created, and closing its last handle, which happens however the supervisor exits,
 /// kills them. A UAC-elevated setup is started by the shell outside any job and is unaffected.
+///
+/// The one exception is a setup refresh helper, which asks to break away so that a rewrite of a
+/// large folder's permissions finishes instead of being killed part-way and restarted by the next
+/// command. It holds the read-ACL lock while it works, and the helpers it would race give up
+/// within the lock wait, so this does not let helpers pile up.
 fn kill_children_with_supervisor() {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     unsafe {
         let job=CreateJobObjectW(std::ptr::null(),std::ptr::null());
         if job==0 {return}
         let mut limits:JOBOBJECT_EXTENDED_LIMIT_INFORMATION=std::mem::zeroed();
-        limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Only a child created with CREATE_BREAKAWAY_FROM_JOB leaves; every other stays.
+        limits.BasicLimitInformation.LimitFlags=
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         let configured=SetInformationJobObject(job,JobObjectExtendedLimitInformation,
             (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
