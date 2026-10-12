@@ -28,7 +28,15 @@ import { quoteShellArgument } from "../sandbox/impl/quoteShellArgument.js";
 import { resolvePotentialPath } from "../sandbox/impl/resolvePotentialPath.js";
 import { resolveSupervisorProtectedPaths } from "../supervisor/resolveSupervisorProtectedPaths.js";
 import { shellEnvironment } from "../processes/impl/shellEnvironment.js";
-import { createSupervisorCommand, createSupervisorPolicy } from "../supervisor/index.js";
+import {
+    createSupervisorCommand,
+    createSupervisorPolicy,
+    createSupervisorShellRunnerCommand,
+    type SupervisorCommand,
+} from "../supervisor/index.js";
+import { shellCommandArgs } from "../processes/impl/shellCommandArgs.js";
+import { NON_INTERACTIVE_TERMINAL_ENVIRONMENT } from "../processes/impl/startProcessTransport.js";
+import { sandboxShellRunnerFor } from "./impl/sandboxShellRunnerFor.js";
 import {
     createProtectedPathMonitor,
     type ProtectedPathMonitor,
@@ -72,6 +80,8 @@ interface PreparedHostCommand {
     command: string;
     processCwd?: string;
     protectedCreatePaths?: readonly string[];
+    /** The long-lived sandbox runner to run this command in, instead of its own supervisor. */
+    runner?: { argv: readonly string[]; command: SupervisorCommand };
     shell?: string;
 }
 
@@ -208,26 +218,70 @@ export function createHostShell(options: HostShellOptions): ComputeShell {
                       ),
                   }),
         });
+        // PowerShell needs the long path: resolving a short-name ancestor
+        // otherwise requires directory listing beyond the traversal grant.
+        const commandCwd = process.platform === "win32" ? await resolvePotentialPath(cwd) : cwd;
         const supervisorCommand = createSupervisorCommand({
             ...(options.environment === undefined ? {} : { environment: options.environment }),
             command: process.platform === "win32" ? command : withWorkingDirectory(command, cwd),
-            // PowerShell needs the long path: resolving a short-name ancestor
-            // otherwise requires directory listing beyond the traversal grant.
-            cwd: process.platform === "win32" ? await resolvePotentialPath(cwd) : cwd,
+            cwd: commandCwd,
             ...(tty === undefined ? {} : { tty }),
             policy,
             shell,
             supervisorPath,
         });
+        // The runner is prepared for the workspace itself. A command elsewhere gets a sandbox
+        // prepared for its own folder, as before.
+        const useRunner =
+            process.platform === "win32" && commandCwd === canonicalCwd && shellRunnerEnabled();
         return {
             args: supervisorCommand.args,
             command: supervisorCommand.command,
             processCwd: canonicalCwd,
+            ...(useRunner
+                ? {
+                      runner: {
+                          argv: [shell, ...shellCommandArgs(shell, command)],
+                          command: createSupervisorShellRunnerCommand({
+                              cwd: canonicalCwd,
+                              ...(options.environment === undefined
+                                  ? {}
+                                  : { environment: options.environment }),
+                              policy,
+                              supervisorPath,
+                          }),
+                      },
+                  }
+                : {}),
             protectedCreatePaths: absoluteDeniedWritePaths.filter(
                 (path) => !existsHostPath(options.cwd, path),
             ),
         };
     };
+
+    const shellRunnerEnabled = () =>
+        (options.environment ?? process.env).HAPPY_WINDOWS_SHELL_RUNNER !== "0" &&
+        process.env.HAPPY_WINDOWS_SHELL_RUNNER !== "0";
+
+    /** Starts a command in the workspace's shared sandbox runner, with its whole environment. */
+    const runnerTransport =
+        (
+            runner: NonNullable<PreparedHostCommand["runner"]>,
+            environment: NodeJS.ProcessEnv,
+            tty: boolean,
+        ) =>
+        () =>
+            sandboxShellRunnerFor(
+                options.ctx,
+                runner.command,
+                options.environment ?? process.env,
+            ).start({
+                argv: runner.argv,
+                env: tty
+                    ? { ...environment, ...NON_INTERACTIVE_TERMINAL_ENVIRONMENT }
+                    : environment,
+                tty,
+            });
 
     /**
      * Makes room for one more command. Running out of slots is our problem, not the model's, so the
@@ -436,6 +490,13 @@ export function createHostShell(options: HostShellOptions): ComputeShell {
             } else if (preparedCommand.shell !== undefined) {
                 processRunOptions.shell = preparedCommand.shell;
             }
+            if (preparedCommand.runner !== undefined) {
+                processRunOptions.transport = runnerTransport(
+                    preparedCommand.runner,
+                    commandEnvironment,
+                    runOptions.tty === true,
+                );
+            }
 
             const protectedPathMonitor = await createProtectedPathMonitor(
                 preparedCommand.protectedCreatePaths ?? [],
@@ -509,6 +570,13 @@ export function createHostShell(options: HostShellOptions): ComputeShell {
                     processStartOptions.args = preparedCommand.args;
                 } else if (preparedCommand.shell !== undefined) {
                     processStartOptions.shell = preparedCommand.shell;
+                }
+                if (preparedCommand.runner !== undefined) {
+                    processStartOptions.transport = runnerTransport(
+                        preparedCommand.runner,
+                        commandEnvironment,
+                        runOptions.tty === true,
+                    );
                 }
                 const protectedPathMonitor = await createProtectedPathMonitor(
                     preparedCommand.protectedCreatePaths ?? [],
