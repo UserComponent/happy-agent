@@ -1343,16 +1343,14 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
             );
         }
         const workspaceId = await this.#workspaces.workspaceForAgent(ctx, agentId);
-        const baseRef =
-            workspaceId === undefined
-                ? undefined
-                : (await this.#workspaces.get(ctx, workspaceId))?.baseRef;
-        const snapshot = await this.#git.snapshot(
-            root.root,
-            undefined,
-            undefined,
-            baseRef === undefined ? {} : { recordedBaseRef: baseRef },
-        );
+        const workspace =
+            workspaceId === undefined ? undefined : await this.#workspaces.get(ctx, workspaceId);
+        const snapshot = await this.#git.snapshot(root.root, undefined, undefined, {
+            ...(workspace?.baseRef === undefined ? {} : { recordedBaseRef: workspace.baseRef }),
+            ...(workspace?.baseCommit === undefined
+                ? {}
+                : { recordedBaseCommit: workspace.baseCommit }),
+        });
         return { success: true, git: this.#git.resource(snapshot) };
     }
 
@@ -2550,6 +2548,9 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                       // The same entity the workspace API tracks: one without the recorded base
                       // would be measured against the default branch and replace that tracker.
                       ...(owner.baseRef === undefined ? {} : { recordedBaseRef: owner.baseRef }),
+                      ...(owner.baseCommit === undefined
+                          ? {}
+                          : { recordedBaseCommit: owner.baseCommit }),
                       ...(owner.workspace === undefined ? {} : { workspaceId: owner.workspace.id }),
                   });
         let lastUserOrFinalAssistantTextMessageAt: number | undefined;
@@ -2667,6 +2668,8 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
         avatarVersion?: number;
         /** The branch the agent's workspace was created from. */
         baseRef?: string;
+        /** The commit the agent's workspace was created at. */
+        baseCommit?: string;
         gitBranch?: string;
         project?: { id: string; kind: "home" | "regular"; name: string };
         workspace?: { id: string; name: string };
@@ -2693,6 +2696,9 @@ export class HappyConnection implements HappySessionOperations, HappySpawnOperat
                     const project = await this.#projects.get(ctx, workspace.projectRef);
                     return {
                         ...(workspace.baseRef === undefined ? {} : { baseRef: workspace.baseRef }),
+                        ...(workspace.baseCommit === undefined
+                            ? {}
+                            : { baseCommit: workspace.baseCommit }),
                         ...(workspace.branch === undefined ? {} : { gitBranch: workspace.branch }),
                         ...(project === undefined
                             ? {}

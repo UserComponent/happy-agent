@@ -6100,15 +6100,16 @@ export class ApiModule implements AgentModule {
         const git = /^\/v0\/workspaces\/([a-z][a-z0-9]*)\/git$/.exec(url.pathname);
         if (git !== null && request.method === "GET") {
             const workspaceId = git[1] as string;
-            const { baseRef, root, runnerId } = await this.#resolveWorkspaceScope(ctx, workspaceId);
+            const { baseCommit, baseRef, root, runnerId } = await this.#resolveWorkspaceScope(
+                ctx,
+                workspaceId,
+            );
             // Live Git state is read only for folders on this machine.
             if (runnerId !== undefined) throw notFound("Git state is not tracked on runners.");
-            const snapshot = await this.#git.snapshot(
-                root,
-                workspaceId,
-                undefined,
-                baseRef === undefined ? {} : { recordedBaseRef: baseRef },
-            );
+            const snapshot = await this.#git.snapshot(root, workspaceId, undefined, {
+                ...(baseRef === undefined ? {} : { recordedBaseRef: baseRef }),
+                ...(baseCommit === undefined ? {} : { recordedBaseCommit: baseCommit }),
+            });
             sendJson(response, 200, { git: this.#git.resource(snapshot) });
             return true;
         }
@@ -6131,7 +6132,7 @@ export class ApiModule implements AgentModule {
             readonly workspaceId: string;
         }[] = [];
         for (const workspaceId of body.workspaceIds) {
-            const { baseRef, projectId, childWorkspaceId, root, runnerId } =
+            const { baseCommit, baseRef, projectId, childWorkspaceId, root, runnerId } =
                 await this.#resolveWorkspaceScope(ctx, workspaceId);
             // A folder on a runner has no live Git state; it is simply absent from the answer.
             if (runnerId !== undefined) continue;
@@ -6139,6 +6140,7 @@ export class ApiModule implements AgentModule {
                 path: root,
                 projectId,
                 ...(baseRef === undefined ? {} : { recordedBaseRef: baseRef }),
+                ...(baseCommit === undefined ? {} : { recordedBaseCommit: baseCommit }),
                 ...(childWorkspaceId === undefined ? {} : { workspaceId: childWorkspaceId }),
             };
             tracked.push({ entity, workspaceId });
@@ -6155,6 +6157,8 @@ export class ApiModule implements AgentModule {
         ctx: Context,
         workspaceId: string,
     ): Promise<{
+        /** The commit a child workspace was created at, on `baseRef`. */
+        readonly baseCommit?: string;
         /** The branch a child workspace was created from. */
         readonly baseRef?: string;
         readonly botId?: string;
@@ -6218,6 +6222,7 @@ export class ApiModule implements AgentModule {
             throw new ApiError(409, "conflict", "The workspace is not available.");
         }
         return {
+            ...(workspace.baseCommit === undefined ? {} : { baseCommit: workspace.baseCommit }),
             ...(workspace.baseRef === undefined ? {} : { baseRef: workspace.baseRef }),
             childWorkspaceId: workspace.id,
             ...(workspace.dockerImage === undefined

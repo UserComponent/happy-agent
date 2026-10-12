@@ -39,6 +39,8 @@ export interface GitComparisonPreferences {
     readonly comparisonBase?: string;
     /** The branch the workspace was created from. */
     readonly recordedBaseRef?: string;
+    /** The commit the workspace was created at, on `recordedBaseRef`. */
+    readonly recordedBaseCommit?: string;
 }
 
 /** The previous answer for this repository, so an inference is not read again on every scan. */
@@ -55,9 +57,10 @@ const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/u;
  * What a branch's changes are measured against.
  *
  * The comparison branch is, in order: the one a person chose for the workspace, the one the
- * workspace was created from unless that is just the default branch, one the repository records
- * for the branch itself (the ref it was created from, its pull request base, or an upstream with a
- * different name), and finally the default branch. The base is that branch's merge base with
+ * workspace was created from unless that is just the default branch or HEAD no longer holds the
+ * commit the workspace was created at, one the repository records for the branch itself (the ref
+ * it was created from, its pull request base, or an upstream with a different name), and finally
+ * the default branch. The base is that branch's merge base with
  * HEAD; HEAD itself (uncommitted work only) when no branch shares history; and the empty tree for
  * a repository without commits.
  *
@@ -142,7 +145,22 @@ export async function resolveGitComparisonBase(options: {
         notices.push(`The chosen comparison branch "${chosen}" was not found.`);
     }
     const recorded = options.preferences?.recordedBaseRef;
-    if (recorded !== undefined && !isDefault(recorded)) {
+    const createdAt = options.preferences?.recordedBaseCommit;
+    // A workspace records where it was cut, not where its branch lives now: one rebased or reset
+    // onto another branch no longer holds the commit it was created at, so its record no longer
+    // says what it is compared with and the repository is asked instead, without a notice.
+    if (
+        recorded !== undefined &&
+        !isDefault(recorded) &&
+        (createdAt === undefined ||
+            (await tryRun(options.run, [
+                "merge-base",
+                "--is-ancestor",
+                "--end-of-options",
+                createdAt,
+                head,
+            ])) !== undefined)
+    ) {
         const found = await measure(recorded, "local");
         if (found !== undefined) return finish(found, "workspace");
         notices.push(`"${recorded}", the branch this workspace was created from, was not found.`);

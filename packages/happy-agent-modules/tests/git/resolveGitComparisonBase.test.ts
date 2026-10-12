@@ -186,6 +186,56 @@ describe("resolveGitComparisonBase", () => {
             });
         });
 
+        it("keeps the recorded branch only while HEAD holds the commit it was created at", async () => {
+            const { main, release, repository } = await releaseRepository();
+            // Workspaces are created at a commit, so the reflog names no branch to infer.
+            await git(repository, ["checkout", "--quiet", "-b", "fix", release]);
+            const created = await commitFile(repository, "fix.txt", "fix\n");
+            const recorded = {
+                recordedBaseCommit: release,
+                recordedBaseRef: "origin/release-v8.8",
+            } as const;
+
+            await expect(
+                resolveOn(repository, created, { branch: "fix", preferences: recorded }),
+            ).resolves.toMatchObject({ base: release, baseSource: "workspace" });
+
+            // Rebased onto a newer tip of the same branch: still holds the commit it was cut at.
+            await git(repository, ["checkout", "--quiet", "--detach", release]);
+            const newerRelease = await commitFile(repository, "release-2.txt", "release 2\n");
+            await git(repository, ["update-ref", "refs/remotes/origin/release-v8.8", newerRelease]);
+            await git(repository, ["checkout", "--quiet", "fix"]);
+            await git(repository, ["rebase", "--quiet", "origin/release-v8.8"]);
+            const rebased = await git(repository, ["rev-parse", "HEAD"]);
+            await expect(
+                resolveOn(repository, rebased, { branch: "fix", preferences: recorded }),
+            ).resolves.toMatchObject({ base: newerRelease, baseSource: "workspace" });
+
+            // Reset onto work based on main: the record no longer says what it is compared with.
+            await git(repository, ["checkout", "--quiet", "--detach", main]);
+            const newerMain = await commitFile(repository, "main-2.txt", "main 2\n");
+            await setOriginMain(repository, newerMain);
+            await git(repository, ["checkout", "--quiet", "fix"]);
+            await git(repository, ["reset", "--quiet", "--hard", newerMain]);
+            const moved = await commitFile(repository, "fix.txt", "fix on main\n");
+            await expect(
+                resolveOn(repository, moved, { branch: "fix", preferences: recorded }),
+            ).resolves.toEqual({
+                base: newerMain,
+                baseCheckedAt: 1_000,
+                baseRef: "refs/remotes/origin/main",
+                baseSource: "default",
+            });
+
+            // Without a recorded commit there is nothing to check the record against.
+            await expect(
+                resolveOn(repository, moved, {
+                    branch: "fix",
+                    preferences: { recordedBaseRef: "origin/release-v8.8" },
+                }),
+            ).resolves.toMatchObject({ base: main, baseSource: "workspace" });
+        });
+
         it("says so when a chosen branch is gone, instead of silently changing the numbers", async () => {
             const { release, repository } = await releaseRepository();
             await git(repository, ["checkout", "--quiet", "-b", "fix", "origin/release-v8.8"]);

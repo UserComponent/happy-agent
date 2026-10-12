@@ -158,6 +158,7 @@ async function fixture() {
     const workspaces = new Map<
         string,
         {
+            baseCommit?: string;
             baseRef?: string;
             id: string;
             name: string;
@@ -1044,6 +1045,7 @@ describe("Happy session activity metadata", () => {
         const test = await fixture();
         test.workspaces.set("workspace-1", {
             ...test.workspaces.get("workspace-1")!,
+            baseCommit: "de6ce8da",
             baseRef: "origin/release-v8.8",
         });
         test.workspaceAgents.set("agent-release", "workspace-1");
@@ -1064,6 +1066,7 @@ describe("Happy session activity metadata", () => {
         expect(test.gitState.tracked).toContainEqual({
             path: "/projects/rig/rpc",
             projectId: "project-1",
+            recordedBaseCommit: "de6ce8da",
             recordedBaseRef: "origin/release-v8.8",
             workspaceId: "workspace-1",
         });
