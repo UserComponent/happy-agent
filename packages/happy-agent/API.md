@@ -3917,7 +3917,8 @@ The git state object:
   these that exists and shares history with `HEAD`:
     1. the workspace's `comparisonBase`, when a person chose one;
     2. the branch the workspace was created from (its `base.ref`), unless that is the default
-       branch;
+       branch, or HEAD no longer contains the workspace's `base.commit` (its branch was rebased
+       or reset onto something else);
     3. a branch the repository records for the current branch: the ref it was created from, the
        pull request base the GitHub CLI records, or an upstream whose branch name differs from
        the current branch's;
