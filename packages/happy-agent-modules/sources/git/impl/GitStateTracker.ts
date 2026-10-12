@@ -159,6 +159,11 @@ export class GitStateTracker {
             .map((tracker) => tracker.key);
     }
 
+    /** The path of every repository being tracked, scanned yet or not. */
+    paths(): readonly string[] {
+        return [...this.#trackers.values()].map((tracker) => tracker.entity.path);
+    }
+
     /** Every repository that has already been scanned, with what the last scan found. */
     tracked(): readonly { entity: GitTrackedEntity; snapshot: GitChangeSnapshot }[] {
         return [...this.#trackers.values()]
