@@ -25,7 +25,10 @@ const WORKTREE_PATH_BATCH = 64;
 const PATH_STATUS_OUTPUT_LIMIT = 64 * 1024;
 const BACKOFF_START_MS = 1_000;
 const BACKOFF_LIMIT_MS = 30_000;
-/** However long a repository has been idle, a full scan still runs this often. */
+/**
+ * However long a repository has been idle, its comparison base is proved again this often: by
+ * merge base when the snapshot names its base branch, and otherwise by a full scan.
+ */
 const FULL_SCAN_LIMIT_MS = 30 * 60 * 1000;
 /** Each unchanged stale check doubles the wait, up to this many times the starting interval. */
 const IDLE_RECONCILE_FACTOR = 10;
@@ -664,25 +667,43 @@ export class GitStateTracker {
      * Whether the delivered snapshot is provably still current, by fingerprint alone.
      *
      * Only a stale check may be answered this way: a Git metadata event or an explicit refresh
-     * always scans. A full scan still runs at least every `FULL_SCAN_LIMIT_MS`, so a missed
-     * `origin/main` move cannot hide behind an unchanged working tree for long.
+     * always scans. The base is proved again at least every `FULL_SCAN_LIMIT_MS`, so a missed
+     * `origin/main` move cannot hide behind an unchanged working tree for long. With HEAD and the
+     * working tree fixed by the fingerprint, an unchanged merge base with the base branch fixes
+     * the diff too, so that proof costs one Git process instead of a full scan.
      */
     async #stillCurrent(tracker: RepositoryTracker, signal: AbortSignal): Promise<boolean> {
         if (
             tracker.fingerprint === undefined ||
             tracker.gitDirectory === undefined ||
             !tracker.snapshotDelivered ||
-            Date.now() - tracker.fullScanAt >= FULL_SCAN_LIMIT_MS
+            tracker.snapshot === undefined
         ) {
             return false;
         }
+        const baseDue = Date.now() - tracker.fullScanAt >= FULL_SCAN_LIMIT_MS;
+        const proof = baseDue ? baseProof(tracker.snapshot) : undefined;
+        if (baseDue && proof === undefined) return false;
         const fingerprint = await readGitWorktreeFingerprint({
             gitDirectory: tracker.gitDirectory,
             path: tracker.entity.path,
             runGit: this.#scan,
             signal,
         });
-        return fingerprint !== undefined && fingerprint === tracker.fingerprint;
+        if (fingerprint === undefined || fingerprint !== tracker.fingerprint) return false;
+        if (proof === undefined) return true;
+        try {
+            const result = await this.#scan({
+                args: ["merge-base", "--end-of-options", proof.ref, proof.head],
+                cwd: tracker.entity.path,
+                signal,
+            });
+            if (result.stdout.trim() !== proof.base) return false;
+        } catch {
+            return false;
+        }
+        tracker.fullScanAt = Date.now();
+        return true;
     }
 
     /** Clears retry backoff and schedules the next stale check: sooner after change, later when idle. */
@@ -714,6 +735,15 @@ export function entityKey(entity: GitTrackedEntity): string {
     return entity.workspaceId === undefined
         ? `project:${entity.projectId}`
         : `workspace:${entity.workspaceId}`;
+}
+
+/** What a merge base must still equal for a snapshot measured against a named base branch. */
+function baseProof(
+    snapshot: GitChangeSnapshot,
+): { base: string; head: string; ref: string } | undefined {
+    const { base, baseRef, facts } = snapshot;
+    if (base === undefined || baseRef === undefined || facts.head === undefined) return undefined;
+    return { base, head: facts.head, ref: baseRef };
 }
 
 function sameState(left: GitChangeSnapshot | undefined, right: GitChangeState): boolean {
