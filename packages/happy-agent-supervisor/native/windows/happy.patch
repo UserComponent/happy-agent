@@ -315,10 +315,20 @@ index 6ba79e6..6d588e9 100644
      Ok(())
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/acl.rs b/codex-rs/windows-sandbox-rs/src/acl.rs
-index 064b7fe..1008d62 100644
+index 064b7fe..8f492b5 100644
 --- a/codex-rs/windows-sandbox-rs/src/acl.rs
 +++ b/codex-rs/windows-sandbox-rs/src/acl.rs
-@@ -524,6 +524,17 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
+@@ -34,7 +34,9 @@ use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+ use windows_sys::Win32::Security::EqualSid;
+ use windows_sys::Win32::Security::GENERIC_MAPPING;
+ use windows_sys::Win32::Security::GetAce;
++use windows_sys::Win32::Security::AddAce;
+ use windows_sys::Win32::Security::GetAclInformation;
++use windows_sys::Win32::Security::InitializeAcl;
+ use windows_sys::Win32::Security::IsValidAcl;
+ use windows_sys::Win32::Security::MapGenericMask;
+ use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+@@ -524,6 +526,17 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
      disallow_mask: u32,
      inheritance: u32,
  ) -> Result<bool> {
@@ -336,7 +346,7 @@ index 064b7fe..1008d62 100644
      let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
      let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
      for sid in sids {
-@@ -553,7 +564,13 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
+@@ -553,7 +566,13 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
              &mut p_new_dacl,
          );
          if code2 == ERROR_SUCCESS {
@@ -351,7 +361,7 @@ index 064b7fe..1008d62 100644
                  to_wide(path).as_ptr() as *mut u16,
                  1,
                  DACL_SECURITY_INFORMATION,
-@@ -561,7 +578,8 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
+@@ -561,7 +580,8 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
                  std::ptr::null_mut(),
                  p_new_dacl,
                  std::ptr::null_mut(),
@@ -361,6 +371,198 @@ index 064b7fe..1008d62 100644
              if code3 == ERROR_SUCCESS {
                  added = true;
                  if !p_new_dacl.is_null() {
+@@ -900,55 +920,156 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool>
+ mod tests;
+ 
+ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
++    // Happy: `REVOKE_ACCESS` removes only allow and audit ACEs, so revoking a
++    // deny-read ACE through `SetEntriesInAclW` silently kept it, while still
++    // rewriting the DACL and re-propagating inheritance through the whole tree.
++    // Drop every explicit allow and deny ACE for `psid` directly instead, and
++    // leave the object alone when it has none.
+     let mut p_sd: *mut c_void = std::ptr::null_mut();
+     let mut p_dacl: *mut ACL = std::ptr::null_mut();
+-    let code = GetNamedSecurityInfoW(
+-        to_wide(path).as_ptr(),
+-        1,
+-        DACL_SECURITY_INFORMATION,
+-        std::ptr::null_mut(),
+-        std::ptr::null_mut(),
+-        &mut p_dacl,
+-        std::ptr::null_mut(),
+-        &mut p_sd,
+-    );
+-    if code != ERROR_SUCCESS {
+-        if !p_sd.is_null() {
+-            LocalFree(p_sd as HLOCAL);
++    let code = unsafe {
++        GetNamedSecurityInfoW(
++            to_wide(path).as_ptr(),
++            1,
++            DACL_SECURITY_INFORMATION,
++            std::ptr::null_mut(),
++            std::ptr::null_mut(),
++            &mut p_dacl,
++            std::ptr::null_mut(),
++            &mut p_sd,
++        )
++    };
++    if code == ERROR_SUCCESS && !p_dacl.is_null() {
++        if let Some(mut without) = unsafe { dacl_without_explicit_aces_for_sid(p_dacl, psid) } {
++            unsafe {
++                let _ = SetNamedSecurityInfoW(
++                    to_wide(path).as_ptr() as *mut u16,
++                    1,
++                    DACL_SECURITY_INFORMATION,
++                    std::ptr::null_mut(),
++                    std::ptr::null_mut(),
++                    without.as_mut_ptr() as *mut ACL,
++                    std::ptr::null_mut(),
++                );
++            }
+         }
+-        return;
+     }
+-    let trustee = TRUSTEE_W {
+-        pMultipleTrustee: std::ptr::null_mut(),
+-        MultipleTrusteeOperation: 0,
+-        TrusteeForm: TRUSTEE_IS_SID,
+-        TrusteeType: TRUSTEE_IS_UNKNOWN,
+-        ptstrName: psid as *mut u16,
++    if !p_sd.is_null() {
++        unsafe { LocalFree(p_sd as HLOCAL) };
++    }
++}
++
++/// A copy of `p_dacl` without the explicit allow and deny ACEs for `psid`, or
++/// `None` when it has none (Happy). The copy is a DWORD-aligned buffer.
++unsafe fn dacl_without_explicit_aces_for_sid(
++    p_dacl: *mut ACL,
++    psid: *mut c_void,
++) -> Option<Vec<u32>> {
++    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
++    let ok = unsafe {
++        GetAclInformation(
++            p_dacl as *const ACL,
++            &mut info as *mut _ as *mut c_void,
++            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
++            AclSizeInformation,
++        )
+     };
+-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+-    explicit.grfAccessPermissions = 0;
+-    explicit.grfAccessMode = 4; // REVOKE_ACCESS
+-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+-    explicit.Trustee = trustee;
+-    let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
+-    let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
+-    if code2 == ERROR_SUCCESS {
+-        let _ = SetNamedSecurityInfoW(
+-            to_wide(path).as_ptr() as *mut u16,
++    if ok == 0 {
++        return None;
++    }
++    let size = info.AclBytesInUse.max(std::mem::size_of::<ACL>() as u32);
++    let mut buffer = vec![0u32; (size as usize).div_ceil(4)];
++    let new_acl = buffer.as_mut_ptr() as *mut ACL;
++    let revision = unsafe { (*p_dacl).AclRevision } as u32;
++    if unsafe { InitializeAcl(new_acl, size, revision) } == 0 {
++        return None;
++    }
++    let mut removed = false;
++    for i in 0..info.AceCount {
++        let mut p_ace: *mut c_void = std::ptr::null_mut();
++        if unsafe { GetAce(p_dacl as *const ACL, i, &mut p_ace) } == 0 {
++            return None;
++        }
++        let hdr = unsafe { &*(p_ace as *const ACE_HEADER) };
++        if unsafe { ace_is_explicit_for_sid(p_ace, psid) }
++            && (hdr.AceType == ACCESS_ALLOWED_ACE_TYPE || hdr.AceType == ACCESS_DENIED_ACE_TYPE)
++        {
++            removed = true;
++            continue;
++        }
++        if unsafe { AddAce(new_acl, revision, u32::MAX, p_ace, hdr.AceSize as u32) } == 0 {
++            return None;
++        }
++    }
++    removed.then_some(buffer)
++}
++
++/// Whether `p_ace` is an explicit (not inherited) ACE naming `psid` (Happy).
++/// Only valid for the allow and deny ACE layouts, which share the SID offset.
++unsafe fn ace_is_explicit_for_sid(p_ace: *mut c_void, psid: *mut c_void) -> bool {
++    let hdr = unsafe { &*(p_ace as *const ACE_HEADER) };
++    if hdr.AceType != ACCESS_ALLOWED_ACE_TYPE && hdr.AceType != ACCESS_DENIED_ACE_TYPE {
++        return false;
++    }
++    if (hdr.AceFlags & INHERITED_ACE) != 0 {
++        return false;
++    }
++    let sid_ptr = (p_ace as usize + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>())
++        as *mut c_void;
++    unsafe { EqualSid(sid_ptr, psid) != 0 }
++}
++
++/// Whether `path` itself carries an explicit read deny for `psid` (Happy).
++///
++/// Only an ACE that denies reading file data counts, so a deny-write ACE for
++/// the same SID, which shares `READ_CONTROL` and `SYNCHRONIZE`, is not one.
++pub unsafe fn path_has_explicit_deny_read_for_sid(path: &Path, psid: *mut c_void) -> bool {
++    const FILE_READ_DATA_MASK: u32 = 0x0001;
++    let mut p_sd: *mut c_void = std::ptr::null_mut();
++    let mut p_dacl: *mut ACL = std::ptr::null_mut();
++    let code = unsafe {
++        GetNamedSecurityInfoW(
++            to_wide(path).as_ptr(),
+             1,
+             DACL_SECURITY_INFORMATION,
+             std::ptr::null_mut(),
+             std::ptr::null_mut(),
+-            p_new_dacl,
++            &mut p_dacl,
+             std::ptr::null_mut(),
+-        );
+-        if !p_new_dacl.is_null() {
+-            LocalFree(p_new_dacl as HLOCAL);
++            &mut p_sd,
++        )
++    };
++    let mut found = false;
++    if code == ERROR_SUCCESS && !p_dacl.is_null() {
++        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
++        let ok = unsafe {
++            GetAclInformation(
++                p_dacl as *const ACL,
++                &mut info as *mut _ as *mut c_void,
++                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
++                AclSizeInformation,
++            )
++        };
++        for i in 0..if ok == 0 { 0 } else { info.AceCount } {
++            let mut p_ace: *mut c_void = std::ptr::null_mut();
++            if unsafe { GetAce(p_dacl as *const ACL, i, &mut p_ace) } == 0 {
++                continue;
++            }
++            let hdr = unsafe { &*(p_ace as *const ACE_HEADER) };
++            if hdr.AceType != ACCESS_DENIED_ACE_TYPE || !unsafe { ace_is_explicit_for_sid(p_ace, psid) } {
++                continue;
++            }
++            let ace = unsafe { &*(p_ace as *const ACCESS_DENIED_ACE) };
++            if ace.Mask & (FILE_READ_DATA_MASK | GENERIC_READ_MASK) != 0 {
++                found = true;
++                break;
++            }
+         }
+     }
+     if !p_sd.is_null() {
+-        LocalFree(p_sd as HLOCAL);
++        unsafe { LocalFree(p_sd as HLOCAL) };
+     }
++    found
+ }
+ 
+ /// Grants RX to the null device for the given SID to support stdout/stderr redirection.
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs b/codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs
 index 1e3c88b..54f4755 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs
@@ -1298,13 +1500,135 @@ index 41b33b6..358d87f 100644
      }
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/deny_read_state.rs b/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
-index fd073a4..76cf0cd 100644
+index fd073a4..009f76f 100644
 --- a/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
 +++ b/codex-rs/windows-sandbox-rs/src/deny_read_state.rs
-@@ -67,6 +67,14 @@ pub unsafe fn sync_persistent_deny_read_acls(
+@@ -1,6 +1,8 @@
++use crate::acl::path_has_explicit_deny_read_for_sid;
+ use crate::acl::revoke_ace;
+ use crate::deny_read_acl::apply_deny_read_acls;
+ use crate::deny_read_acl::lexical_path_key;
++use crate::deny_read_acl::plan_deny_read_acl_paths;
+ use crate::setup::sandbox_dir;
+ use anyhow::Context;
+ use anyhow::Result;
+@@ -27,6 +29,13 @@ struct PersistentDenyReadAclState {
+ /// each SID, apply the new desired set first, and only then revoke stale paths
+ /// from the same SID so profile changes do not leave old deny-read ACEs behind.
+ ///
++/// Happy: the state is only as good as its record of what was applied, so the
++/// paths about to be applied are recorded before any ACE is written. A setup
++/// killed part-way through then leaves them listed, and the next setup revokes
++/// whichever it does not want. A deny on the user profile root that no record
++/// lists, left by an earlier build that recorded only after applying, is found
++/// in the profile's actual ACL and revoked as well.
++///
+ /// # Safety
+ /// Caller must pass a valid SID pointer matching `principal_sid`.
+ pub unsafe fn sync_persistent_deny_read_acls(
+@@ -34,6 +43,29 @@ pub unsafe fn sync_persistent_deny_read_acls(
+     principal_sid: &str,
+     desired_paths: &[PathBuf],
+     psid: *mut c_void,
++) -> Result<Vec<PathBuf>> {
++    unsafe {
++        sync_deny_read_acls_with_candidates(
++            codex_home,
++            principal_sid,
++            desired_paths,
++            psid,
++            &unrecorded_deny_read_candidates(),
++        )
++    }
++}
++
++/// `sync_persistent_deny_read_acls`, checking `unrecorded` paths' actual ACLs
++/// for a deny this principal holds there that no record lists (Happy).
++///
++/// # Safety
++/// Caller must pass a valid SID pointer matching `principal_sid`.
++unsafe fn sync_deny_read_acls_with_candidates(
++    codex_home: &Path,
++    principal_sid: &str,
++    desired_paths: &[PathBuf],
++    psid: *mut c_void,
++    unrecorded: &[PathBuf],
+ ) -> Result<Vec<PathBuf>> {
+     let state_path = sandbox_dir(codex_home).join(DENY_READ_ACL_STATE_FILE);
+     let mut state = load_state(&state_path)?;
+@@ -43,15 +75,39 @@ pub unsafe fn sync_persistent_deny_read_acls(
+         .cloned()
+         .unwrap_or_default();
+ 
++    // Record what is about to be applied before applying it (Happy).
++    let intended = with_intended_paths(&previous_paths, &plan_deny_read_acl_paths(desired_paths)?);
++    if intended.len() != previous_paths.len() {
++        state
++            .principals
++            .insert(principal_sid.to_string(), intended);
++        store_state(&state_path, &state)?;
++    }
++
+     let applied_paths = unsafe { apply_deny_read_acls(desired_paths, psid) }?;
+     let desired_keys = applied_paths
+         .iter()
+         .map(|path| lexical_path_key(path))
+         .collect::<HashSet<_>>();
+ 
++    let previous_keys = previous_paths
++        .iter()
++        .map(|path| lexical_path_key(path))
++        .collect::<HashSet<_>>();
+     for path in previous_paths {
+         if !desired_keys.contains(&lexical_path_key(&path)) {
+-            revoke_ace(&path, psid);
++            unsafe { revoke_ace(&path, psid) };
++        }
++    }
++    // Revoking rewrites a whole tree's inherited ACEs, so only a deny that is
++    // actually there is revoked.
++    for path in unrecorded {
++        let key = lexical_path_key(path);
++        if !desired_keys.contains(&key)
++            && !previous_keys.contains(&key)
++            && unsafe { path_has_explicit_deny_read_for_sid(path, psid) }
++        {
++            unsafe { revoke_ace(path, psid) };
+         }
+     }
+ 
+@@ -67,6 +123,42 @@ pub unsafe fn sync_persistent_deny_read_acls(
      Ok(applied_paths)
  }
  
++/// The recorded paths followed by every planned path they do not already hold.
++fn with_intended_paths(previous: &[PathBuf], planned: &[PathBuf]) -> Vec<PathBuf> {
++    let mut keys = previous
++        .iter()
++        .map(|path| lexical_path_key(path))
++        .collect::<HashSet<_>>();
++    let mut intended = previous.to_vec();
++    for path in planned {
++        if keys.insert(lexical_path_key(path)) {
++            intended.push(path.clone());
++        }
++    }
++    intended
++}
++
++/// Paths where an earlier build could leave a deny it no longer records (Happy).
++///
++/// Only the profile root is denied by one workspace and allowed by another, so
++/// it is the one path whose deny a lost record leaves blocking every workspace
++/// inside the profile.
++fn unrecorded_deny_read_candidates() -> Vec<PathBuf> {
++    crate::happy_setup_gate::default_state_directory()
++        .ok()
++        .and_then(|state| state.parent()?.parent().map(Path::to_path_buf))
++        .into_iter()
++        .collect()
++}
++
 +/// The persisted deny-read state exactly as stored, or `None` when there is none (Happy).
 +///
 +/// Every reconciliation rewrites the file deterministically, so equal bytes mean no setup has
@@ -1316,6 +1640,148 @@ index fd073a4..76cf0cd 100644
  fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
      match std::fs::read(path) {
          Ok(bytes) => serde_json::from_slice(&bytes)
+@@ -80,8 +172,138 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
+     }
+ }
+ 
++/// Replaces the state in one step, so a setup killed while writing it never
++/// leaves a truncated file that every later setup would fail to parse (Happy).
+ fn store_state(path: &Path, state: &PersistentDenyReadAclState) -> Result<()> {
+     let bytes = serde_json::to_vec_pretty(state).context("serialize deny-read ACL state")?;
+-    std::fs::write(path, bytes)
+-        .with_context(|| format!("write deny-read ACL state {}", path.display()))
++    let temporary = path.with_extension("json.tmp");
++    std::fs::write(&temporary, bytes)
++        .with_context(|| format!("write deny-read ACL state {}", temporary.display()))?;
++    std::fs::rename(&temporary, path)
++        .with_context(|| format!("replace deny-read ACL state {}", path.display()))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use windows_sys::Win32::Foundation::HLOCAL;
++    use windows_sys::Win32::Foundation::LocalFree;
++    use crate::acl::add_deny_read_ace;
++    use crate::token::convert_string_sid_to_sid;
++    use pretty_assertions::assert_eq;
++    use tempfile::TempDir;
++
++    const PRINCIPAL: &str = "S-1-5-21-1111111111-2222222222-3333333333-4444";
++
++    fn recorded(home: &Path) -> Vec<PathBuf> {
++        load_state(&sandbox_dir(home).join(DENY_READ_ACL_STATE_FILE))
++            .unwrap()
++            .principals
++            .remove(PRINCIPAL)
++            .unwrap_or_default()
++    }
++
++    #[test]
++    fn intended_paths_keep_the_record_and_add_new_paths_once() {
++        let previous = vec![PathBuf::from(r"C:\Users\a\.ssh")];
++        let planned = vec![PathBuf::from(r"c:\users\a\.SSH"), PathBuf::from(r"C:\Users\a")];
++        assert_eq!(
++            vec![PathBuf::from(r"C:\Users\a\.ssh"), PathBuf::from(r"C:\Users\a")],
++            with_intended_paths(&previous, &planned)
++        );
++    }
++
++    #[test]
++    fn records_paths_before_applying_them_so_an_interrupted_setup_is_undone() {
++        let home = TempDir::new().unwrap();
++        std::fs::create_dir_all(sandbox_dir(home.path())).unwrap();
++        let denied = TempDir::new().unwrap();
++        let blocker = denied.path().join("file");
++        std::fs::write(&blocker, b"").unwrap();
++        // A path that cannot be created stops the setup after it recorded its intent.
++        let unreachable = blocker.join("below-a-file");
++        let psid = unsafe { convert_string_sid_to_sid(PRINCIPAL) }.unwrap();
++
++        let interrupted = unsafe {
++            sync_deny_read_acls_with_candidates(
++                home.path(),
++                PRINCIPAL,
++                &[denied.path().to_path_buf(), unreachable.clone()],
++                psid,
++                &[],
++            )
++        };
++        assert!(interrupted.is_err());
++        assert_eq!(vec![denied.path().to_path_buf(), unreachable], recorded(home.path()));
++
++        // The next setup wants neither, so it revokes both and forgets them.
++        unsafe { add_deny_read_ace(denied.path(), psid) }.unwrap();
++        let applied = unsafe {
++            sync_deny_read_acls_with_candidates(home.path(), PRINCIPAL, &[], psid, &[])
++        }
++        .unwrap();
++        assert!(applied.is_empty());
++        assert!(!unsafe { path_has_explicit_deny_read_for_sid(denied.path(), psid) });
++        assert!(recorded(home.path()).is_empty());
++        unsafe { LocalFree(psid as HLOCAL) };
++    }
++
++    #[test]
++    fn revokes_an_unrecorded_deny_found_in_the_actual_acl() {
++        let home = TempDir::new().unwrap();
++        std::fs::create_dir_all(sandbox_dir(home.path())).unwrap();
++        let profile = TempDir::new().unwrap();
++        let kept = TempDir::new().unwrap();
++        let psid = unsafe { convert_string_sid_to_sid(PRINCIPAL) }.unwrap();
++        // A deny an earlier build applied and then lost from its record.
++        unsafe { add_deny_read_ace(profile.path(), psid) }.unwrap();
++        assert!(unsafe { path_has_explicit_deny_read_for_sid(profile.path(), psid) });
++
++        let unrecorded = [profile.path().to_path_buf(), kept.path().to_path_buf()];
++        unsafe {
++            sync_deny_read_acls_with_candidates(
++                home.path(),
++                PRINCIPAL,
++                &[kept.path().to_path_buf()],
++                psid,
++                &unrecorded,
++            )
++        }
++        .unwrap();
++        assert!(!unsafe { path_has_explicit_deny_read_for_sid(profile.path(), psid) });
++        // A candidate this setup wants stays denied.
++        assert!(unsafe { path_has_explicit_deny_read_for_sid(kept.path(), psid) });
++        assert_eq!(vec![kept.path().to_path_buf()], recorded(home.path()));
++
++        unsafe { revoke_ace(kept.path(), psid) };
++        unsafe { LocalFree(psid as HLOCAL) };
++    }
++    #[test]
++    fn revoking_removes_a_deny_read_ace_and_leaves_other_principals_alone() {
++        let dir = TempDir::new().unwrap();
++        let psid = unsafe { convert_string_sid_to_sid(PRINCIPAL) }.unwrap();
++        let other = unsafe { convert_string_sid_to_sid("S-1-5-21-1111111111-2222222222-3333333333-5555") }
++            .unwrap();
++        unsafe { add_deny_read_ace(dir.path(), psid) }.unwrap();
++        unsafe { add_deny_read_ace(dir.path(), other) }.unwrap();
++        assert!(unsafe { path_has_explicit_deny_read_for_sid(dir.path(), psid) });
++
++        let child = dir.path().join("child");
++        std::fs::create_dir(&child).unwrap();
++        let inherited = |path: &Path| {
++            let out = std::process::Command::new("icacls").arg(path).output().unwrap();
++            String::from_utf8_lossy(&out.stdout).contains(&PRINCIPAL[4..])
++        };
++        assert!(inherited(&child));
++
++        unsafe { revoke_ace(dir.path(), psid) };
++        assert!(!unsafe { path_has_explicit_deny_read_for_sid(dir.path(), psid) });
++        // The children lose the inherited copies too.
++        assert!(!inherited(&child));
++        assert!(unsafe { path_has_explicit_deny_read_for_sid(dir.path(), other) });
++
++        unsafe { revoke_ace(dir.path(), other) };
++        unsafe { LocalFree(psid as HLOCAL) };
++        unsafe { LocalFree(other as HLOCAL) };
++    }
++}
+\ No newline at end of file
 diff --git a/codex-rs/windows-sandbox-rs/src/desktop.rs b/codex-rs/windows-sandbox-rs/src/desktop.rs
 index d8e7d19..7d55a5a 100644
 --- a/codex-rs/windows-sandbox-rs/src/desktop.rs
