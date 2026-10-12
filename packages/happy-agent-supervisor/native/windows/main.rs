@@ -115,6 +115,149 @@ fn serve_worker(runner: WindowsSandboxServedRunner) -> Result<i32> {
     Ok(0)
 }
 
+/// One request from the daemon to a `--shell-runner`, as one JSON line on stdin.
+#[derive(Deserialize)]
+#[serde(tag="type", rename_all="camelCase", deny_unknown_fields)]
+enum ShellRunnerRequest {
+    Run {
+        id: u64,
+        argv: Vec<String>,
+        /// The command's complete environment. The runner itself holds none to hand down.
+        env: HashMap<String,String>,
+        #[serde(default)] tty: bool,
+        #[serde(default, rename="timeoutMs")] timeout_ms: Option<u64>,
+    },
+    Stdin { id: u64, data: String },
+    CloseStdin { id: u64 },
+    Resize { id: u64, rows: u16, cols: u16 },
+    Terminate { id: u64 },
+}
+
+/// What a shell runner adds to every command's own environment.
+struct ShellRunnerEnvironment {
+    cwd: PathBuf,
+    local_binding: bool,
+    /// Holds one scratch folder per running command.
+    scratch: PathBuf,
+}
+
+impl ShellRunnerEnvironment {
+    fn command_env(&self, mut env:HashMap<String,String>, scratch:&std::path::Path) -> HashMap<String,String> {
+        for key in ["TEMP", "TMP", "TMPDIR"] {
+            env.insert(key.into(), scratch.to_string_lossy().into_owned());
+        }
+        // This is an explicit permission, never an inherited ambient setting.
+        env.remove("CODEX_NETWORK_ALLOW_LOCAL_BINDING");
+        if self.local_binding {env.insert("CODEX_NETWORK_ALLOW_LOCAL_BINDING".into(),"1".into());}
+        codex_windows_sandbox::normalize_served_command_env(&mut env,&self.cwd);
+        env
+    }
+}
+
+/// Serves one workspace's shell commands under one policy, many at once, over JSON lines on stdio.
+///
+/// Like the worker, the runner pays once for the setup refresh, the sandbox logon, and the private
+/// desktop. Unlike it, commands run concurrently, may have a terminal and input, and bring their
+/// complete environment with every request. Each command gets its own restricted token, job, and
+/// scratch folder, which is deleted when the command ends. Commands are told apart by the id the
+/// daemon gives them. If the sandboxed runner dies, every running command gets an error and this
+/// process exits; closing stdin stops every command and then this process.
+fn serve_shell_runner(runner: WindowsSandboxServedRunner, environment: ShellRunnerEnvironment) -> Result<i32> {
+    let WindowsSandboxServedRunner {pipe_write, mut pipe_read, template}=runner;
+    let pipe_write=Arc::new(Mutex::new(Some(pipe_write)));
+    // Every command that has been sent and has not yet ended, with its scratch folder.
+    let running=Arc::new(Mutex::new(HashMap::<u64,PathBuf>::new()));
+    let environment=Arc::new(environment);
+    {
+        let pipe_write=Arc::clone(&pipe_write);
+        let running=Arc::clone(&running);
+        let environment=Arc::clone(&environment);
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line)=line else {break};
+                if line.trim().is_empty() {continue}
+                let request=match serde_json::from_str::<ShellRunnerRequest>(&line) {
+                    Ok(request) => request,
+                    Err(err) => {let _=emit(json!({"type":"protocolError","message":err.to_string()}));break}
+                };
+                let (id,message)=match request {
+                    ShellRunnerRequest::Run {id,argv,env,tty,timeout_ms} => {
+                        if let Err(err)=start_shell_command(&pipe_write,&running,&environment,&template,id,argv,env,tty,timeout_ms) {
+                            let _=emit(json!({"type":"error","id":id,"message":format!("{err:#}")}));
+                        }
+                        continue;
+                    }
+                    ShellRunnerRequest::Stdin {id,data} => (id,Message::Stdin {payload:codex_windows_sandbox::StdinPayload {data_b64:data}}),
+                    ShellRunnerRequest::CloseStdin {id} => (id,Message::CloseStdin {payload:Default::default()}),
+                    ShellRunnerRequest::Resize {id,rows,cols} => (id,Message::Resize {payload:codex_windows_sandbox::ResizePayload {rows,cols}}),
+                    ShellRunnerRequest::Terminate {id} => (id,Message::Terminate {payload:Default::default()}),
+                };
+                let _=send_frame(&pipe_write,id,false,message);
+            }
+            // Closing the pipe tells the sandboxed runner to stop everything and exit.
+            if let Ok(mut pipe)=pipe_write.lock() {pipe.take();}
+        });
+    }
+    emit(json!({"type":"ready"}))?;
+    loop {
+        let frame=match codex_windows_sandbox::read_served_frame(&mut pipe_read) {
+            Ok(Some(frame)) => frame,
+            Ok(None) | Err(_) => break,
+        };
+        let id=frame.id;
+        match frame.frame.message {
+            Message::SpawnReady {payload} => emit(json!({"type":"spawned","id":id,"pid":payload.process_id}))?,
+            Message::Output {payload} => emit(json!({"type":payload.stream,"id":id,"data":payload.data_b64}))?,
+            Message::Exit {payload} => {
+                finish_shell_command(&running,id);
+                emit(json!({"type":"exit","id":id,"code":payload.exit_code,"timedOut":payload.timed_out}))?;
+            }
+            Message::Error {payload} => {
+                finish_shell_command(&running,id);
+                emit(json!({"type":"error","id":id,"message":payload.message}))?;
+            }
+            _ => {}
+        }
+    }
+    // The runner is gone, and every command it was running went with it.
+    let orphaned:Vec<u64>=running.lock().map(|running| running.keys().copied().collect()).unwrap_or_default();
+    for id in orphaned {
+        finish_shell_command(&running,id);
+        emit(json!({"type":"error","id":id,"message":"The sandbox runner stopped, so this command was stopped too."}))?;
+    }
+    let closed=pipe_write.lock().map(|pipe| pipe.is_none()).unwrap_or(false);
+    Ok(if closed {0} else {1})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_shell_command(
+    pipe_write:&Mutex<Option<std::fs::File>>, running:&Mutex<HashMap<u64,PathBuf>>, environment:&ShellRunnerEnvironment,
+    template:&codex_windows_sandbox::SpawnRequest, id:u64, argv:Vec<String>, env:HashMap<String,String>, tty:bool, timeout_ms:Option<u64>,
+) -> Result<()> {
+    if argv.is_empty() {bail!("missing command")}
+    let scratch=environment.scratch.join(format!("command-{id}"));
+    {
+        let mut running=running.lock().map_err(|_| anyhow::anyhow!("runner state lock poisoned"))?;
+        if running.contains_key(&id) {bail!("command {id} is already running")}
+        std::fs::create_dir(&scratch).context("create the command's scratch folder")?;
+        running.insert(id,scratch.clone());
+    }
+    let request=codex_windows_sandbox::SpawnRequest {
+        command:argv, env:environment.command_env(env,&scratch), timeout_ms, tty, stdin_open:true, ..template.clone()
+    };
+    if let Err(err)=send_frame(pipe_write,id,true,Message::SpawnRequest {payload:Box::new(request)}) {
+        finish_shell_command(running,id);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Forgets a command that ended and deletes its scratch folder.
+fn finish_shell_command(running:&Mutex<HashMap<u64,PathBuf>>, id:u64) {
+    let scratch=running.lock().ok().and_then(|mut running| running.remove(&id));
+    if let Some(scratch)=scratch {let _=std::fs::remove_dir_all(scratch);}
+}
+
 async fn run() -> Result<i32> {
     let mut args=std::env::args().skip(1);
     let mut policy=None;
@@ -126,6 +269,7 @@ async fn run() -> Result<i32> {
     let mut retry=false;
     let mut no_provision=false;
     let mut worker=false;
+    let mut shell_runner=false;
     let mut command=Vec::new();
     while let Some(arg)=args.next() {
         match arg.as_str() {
@@ -138,6 +282,7 @@ async fn run() -> Result<i32> {
             "--retry" => retry=true,
             "--no-provision" => no_provision=true,
             "--worker" => worker=true,
+            "--shell-runner" => shell_runner=true,
             "--" => {command.extend(args);break;},
             _ => bail!("unknown supervisor argument: {arg}"),
         }
@@ -146,7 +291,7 @@ async fn run() -> Result<i32> {
     let state=match state {Some(path)=>path,None=>default_state_directory()?};
     if !state.is_absolute() {bail!("state must be absolute")}
     if setup || status {
-        if setup && status || retry && !setup || policy.is_some() || !command.is_empty() || tty || worker {bail!("setup/status must not include a command or policy")}
+        if setup && status || retry && !setup || policy.is_some() || !command.is_empty() || tty || worker || shell_runner {bail!("setup/status must not include a command or policy")}
         if setup {
             let permissions=codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile(&PermissionProfile::read_only())?;
             let mut env:HashMap<String,String>=std::env::vars().collect();
@@ -165,7 +310,10 @@ async fn run() -> Result<i32> {
     // The installation state is never part of a project command's writable surface.
     p.denied_write_paths.push(state.clone());
     p.denied_write_paths.push(default_state_directory()?);
-    if worker {
+    if worker && shell_runner {bail!("choose either --worker or --shell-runner")}
+    if shell_runner {
+        if !command.is_empty() || tty {bail!("a shell runner receives its commands on stdin")}
+    } else if worker {
         if !command.is_empty() || tty {bail!("a worker receives its commands on stdin")}
         if p.mode!="read_only" || p.network.egress || p.network.local_binding {bail!("a worker runs only read-only commands without network access")}
     } else if command.is_empty() {bail!("missing command")}
@@ -244,6 +392,23 @@ async fn run() -> Result<i32> {
         }).await?;
         // The scratch directory lives exactly as long as the worker that writes to it.
         let code=serve_worker(runner)?;
+        drop(temporary);
+        return Ok(code);
+    }
+    if shell_runner {
+        let local_binding=p.network.local_binding;
+        let runner=spawn_windows_sandbox_served_runner(WindowsSandboxSessionRequest {
+            permission_profile:&profile, workspace_roots:&roots, codex_home:&state,
+            command:vec!["happy-sandbox-shell-runner".into()], cwd:&cwd, env_map:env, windows_sandbox_level:WindowsSandboxLevel::Elevated,
+            proxy_enforced:false, network_proxy_restricting_sid:None,
+            proxy_settings_mode:WindowsSandboxProxySettingsMode::Reconcile,
+            timeout_ms:None, read_roots_override:Some(&read_roots), read_roots_include_platform_defaults:false,
+            write_roots_override:Some(&write_roots), deny_read_paths_override:&denied_read,
+            // Each command asks for its own terminal and input; the runner itself has neither.
+            deny_write_paths_override:&denied_write, tty:false, stdin_open:false, use_private_desktop:true,
+        }).await?;
+        // Every command scratch folder lives inside this one, which lives as long as the runner.
+        let code=serve_shell_runner(runner,ShellRunnerEnvironment {cwd:cwd.clone(),local_binding,scratch:temporary_path.clone()})?;
         drop(temporary);
         return Ok(code);
     }

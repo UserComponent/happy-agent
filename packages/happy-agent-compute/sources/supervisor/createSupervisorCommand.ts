@@ -66,6 +66,31 @@ export function createSupervisorWorkerCommand(options: {
     };
 }
 
+/**
+ * A native Windows runner that runs one workspace's shell commands, concurrently, under one policy.
+ *
+ * Each command arrives on stdin with its own argv and complete environment; the runner holds none
+ * of its own to pass on.
+ */
+export function createSupervisorShellRunnerCommand(options: {
+    cwd: string;
+    environment?: NodeJS.ProcessEnv;
+    policy: SupervisorPolicy;
+    supervisorPath: string;
+}): SupervisorCommand {
+    return {
+        args: [
+            "--policy",
+            JSON.stringify(options.policy),
+            ...windowsStateArgs(options.environment),
+            "--cwd",
+            options.cwd,
+            "--shell-runner",
+        ],
+        command: options.supervisorPath,
+    };
+}
+
 function windowsStateArgs(environment: NodeJS.ProcessEnv = process.env): string[] {
     // Native Windows resolves its installation state from the actual Windows user profile.
     // App homes, project folders, and emulated HOME/USERPROFILE values must not select accounts.
