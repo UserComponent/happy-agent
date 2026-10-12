@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { lstat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, join, normalize, relative, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type { Context } from "@steve.kite/stdlib";
 import { resolveSupervisorBinary } from "@slopus/happy-agent-supervisor";
@@ -23,8 +22,7 @@ import {
     type ProcessStartOptions,
 } from "../processes/index.js";
 import { createToolEnvironment } from "../sandbox/impl/createToolEnvironment.js";
-import { createHostPolicyPrivatePaths } from "../sandbox/impl/createHostPolicyPrivatePaths.js";
-import { createSensitiveReadPaths } from "../sandbox/impl/createSensitiveReadPaths.js";
+
 import { projectProtectedFileNames } from "../sandbox/impl/projectProtectedFileNames.js";
 import { quoteShellArgument } from "../sandbox/impl/quoteShellArgument.js";
 import { resolvePotentialPath } from "../sandbox/impl/resolvePotentialPath.js";
@@ -35,6 +33,11 @@ import {
     createProtectedPathMonitor,
     type ProtectedPathMonitor,
 } from "./impl/createProtectedPathMonitor.js";
+import {
+    absoluteHostPaths,
+    defaultHomeDirectory,
+    resolveHostDeniedReadPaths,
+} from "./impl/resolveHostDeniedReadPaths.js";
 import {
     DEFAULT_HOST_COMMAND_TIMEOUT_MS,
     DEFAULT_HOST_MAX_OUTPUT_BYTES,
@@ -149,21 +152,13 @@ export function createHostShell(options: HostShellOptions): ComputeShell {
             return { command, shell };
         }
         const canonicalCwd = await resolveCanonicalWorkspace();
-        const canonicalHome = await resolvePotentialPath(options.homeDirectory ?? homedir());
-        const privatePaths = absoluteHostPaths(
+        const { privatePaths, sensitiveReadPaths } = resolveHostDeniedReadPaths({
             canonicalCwd,
-            createHostPolicyPrivatePaths(options.hostPolicy, options.environment),
-        );
-        const sensitiveReadPaths = absoluteHostPaths(
-            canonicalCwd,
-            createSensitiveReadPaths({
-                ...(options.environment === undefined ? {} : { environment: options.environment }),
-                ...(options.homeDirectory === undefined
-                    ? {}
-                    : { homeDirectory: options.homeDirectory }),
-                ...(options.hostPolicy === undefined ? {} : { hostPolicy: options.hostPolicy }),
-            }),
-        ).filter((path) => shouldDenySensitiveReadPath(path, canonicalCwd, canonicalHome));
+            canonicalHome: await resolvePotentialPath(defaultHomeDirectory(options.homeDirectory)),
+            environment: options.environment,
+            homeDirectory: options.homeDirectory,
+            hostPolicy: options.hostPolicy,
+        });
         const protectedDirectoryNames =
             process.platform === "win32" ? [".git", ".agents", ".codex"] : [".git"];
         const protectedNames = [
@@ -644,12 +639,6 @@ async function cleanUpCommandResources(
     };
 }
 
-function absoluteHostPaths(cwd: string, paths: readonly string[]): string[] {
-    return [
-        ...new Set(paths.map((path) => (isAbsolute(path) ? normalize(path) : resolve(cwd, path)))),
-    ];
-}
-
 function withWorkingDirectory(command: string, cwd: string): string {
     return `cd ${quoteShellArgument(cwd)} && ${command}`;
 }
@@ -701,23 +690,6 @@ async function rejectSymlinkedPaths(paths: readonly string[]): Promise<void> {
             throw error;
         }
     }
-}
-
-function shouldDenySensitiveReadPath(path: string, cwd: string, homeDirectory: string): boolean {
-    const normalizedPath = normalize(path);
-    const normalizedHome = normalize(homeDirectory);
-    if (normalizedPath !== normalizedHome) return true;
-    const normalizedCwd = normalize(cwd);
-    // The package protects the home tree by default, but an ordinary workspace usually lives
-    // below it. Masking the whole home tree in that case would also mask the workspace. Keep all
-    // narrower credential paths in the policy, and only omit the broad home root for a strict
-    // descendant workspace; a workspace equal to or above home remains protected.
-    return !(normalizedCwd !== normalizedHome && isPathInside(normalizedHome, normalizedCwd));
-}
-
-function isPathInside(root: string, target: string): boolean {
-    const relativePath = relative(root, target);
-    return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
 }
 
 function errorToMessage(error: unknown): string {

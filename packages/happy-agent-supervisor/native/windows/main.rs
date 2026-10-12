@@ -3,10 +3,10 @@
 use anyhow::{bail, Context, Result};
 use codex_protocol::{config_types::WindowsSandboxLevel, models::PermissionProfile};
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_windows_sandbox::{forward_sandbox_session_stdio, spawn_windows_sandbox_session_for_level, WindowsSandboxProxySettingsMode, WindowsSandboxSessionRequest};
+use codex_windows_sandbox::{forward_sandbox_session_stdio, spawn_windows_sandbox_served_runner, spawn_windows_sandbox_session_for_level, FramedMessage, Message, ServedFrame, WindowsSandboxProxySettingsMode, WindowsSandboxServedRunner, WindowsSandboxSessionRequest, IPC_PROTOCOL_VERSION};
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, io::{BufRead, Write}, path::PathBuf, sync::{mpsc, Arc, Mutex}};
 
 use codex_windows_sandbox::happy_default_state_directory as default_state_directory;
 
@@ -38,6 +38,83 @@ fn path_in_write_roots(path:&std::path::Path, roots:&[PathBuf]) -> bool {
     roots.iter().any(|root| codex_windows_sandbox::workspace_write_root_contains_path(root,path))
 }
 
+/// One request from the daemon to a `--worker`, as one JSON line on stdin.
+#[derive(Deserialize)]
+#[serde(tag="type", rename_all="camelCase", deny_unknown_fields)]
+enum WorkerRequest {
+    Run { id: u64, argv: Vec<String>, #[serde(default, rename="timeoutMs")] timeout_ms: Option<u64> },
+    Terminate { id: u64 },
+}
+
+fn emit(line: serde_json::Value) -> Result<()> {
+    let mut out=std::io::stdout().lock();
+    serde_json::to_writer(&mut out,&line)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Writes one frame for command `id`. Fails once the pipe has been closed on purpose.
+fn send_frame(pipe:&Mutex<Option<std::fs::File>>, id:u64, keep_descendants:bool, message:Message) -> Result<()> {
+    let mut pipe=pipe.lock().map_err(|_| anyhow::anyhow!("runner pipe lock poisoned"))?;
+    let pipe=pipe.as_mut().context("the sandbox runner is closing")?;
+    codex_windows_sandbox::write_served_frame(pipe,&ServedFrame {id,keep_descendants,frame:FramedMessage {version:IPC_PROTOCOL_VERSION,message}})
+}
+
+/// Serves one workspace's read-only commands, one at a time, over JSON lines on stdio.
+///
+/// The worker pays once for what every sandboxed command used to pay: the setup refresh, the
+/// sandbox logon, the private desktop, and the scratch directory. Each command still runs under
+/// its own restricted token and job. Closing stdin ends the running command and the worker.
+fn serve_worker(runner: WindowsSandboxServedRunner) -> Result<i32> {
+    let WindowsSandboxServedRunner {pipe_write, mut pipe_read, template}=runner;
+    let pipe_write=Arc::new(Mutex::new(Some(pipe_write)));
+    let current=Arc::new(Mutex::new(None::<u64>));
+    let (runs, queued)=mpsc::channel::<(u64,Vec<String>,Option<u64>)>();
+    {
+        let pipe_write=Arc::clone(&pipe_write);
+        let current=Arc::clone(&current);
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line)=line else {break};
+                if line.trim().is_empty() {continue}
+                match serde_json::from_str::<WorkerRequest>(&line) {
+                    Ok(WorkerRequest::Run {id,argv,timeout_ms}) => {
+                        if argv.is_empty() || runs.send((id,argv,timeout_ms)).is_err() {break}
+                    }
+                    Ok(WorkerRequest::Terminate {id}) => {
+                        let _=send_frame(&pipe_write,id,false,Message::Terminate {payload:Default::default()});
+                    }
+                    Err(err) => {let _=emit(json!({"type":"protocolError","message":err.to_string()}));break}
+                }
+            }
+            if let Ok(current)=current.lock() && let Some(id)=*current {
+                let _=send_frame(&pipe_write,id,false,Message::Terminate {payload:Default::default()});
+            }
+        });
+    }
+    emit(json!({"type":"ready"}))?;
+    for (id,argv,timeout_ms) in queued {
+        *current.lock().map_err(|_| anyhow::anyhow!("worker state lock poisoned"))?=Some(id);
+        send_frame(&pipe_write,id,false,Message::SpawnRequest {payload:Box::new(codex_windows_sandbox::SpawnRequest {command:argv,timeout_ms,..template.clone()})})?;
+        loop {
+            let Some(frame)=codex_windows_sandbox::read_served_frame(&mut pipe_read)? else {
+                emit(json!({"type":"error","id":id,"message":"The sandbox runner stopped."}))?;
+                return Ok(1);
+            };
+            if frame.id!=id {continue}
+            match frame.frame.message {
+                Message::Output {payload} => emit(json!({"type":payload.stream,"id":id,"data":payload.data_b64}))?,
+                Message::Exit {payload} => {emit(json!({"type":"exit","id":id,"code":payload.exit_code,"timedOut":payload.timed_out}))?;break}
+                Message::Error {payload} => {emit(json!({"type":"error","id":id,"message":payload.message}))?;break}
+                _ => {}
+            }
+        }
+        *current.lock().map_err(|_| anyhow::anyhow!("worker state lock poisoned"))?=None;
+    }
+    Ok(0)
+}
+
 async fn run() -> Result<i32> {
     let mut args=std::env::args().skip(1);
     let mut policy=None;
@@ -48,6 +125,7 @@ async fn run() -> Result<i32> {
     let mut status=false;
     let mut retry=false;
     let mut no_provision=false;
+    let mut worker=false;
     let mut command=Vec::new();
     while let Some(arg)=args.next() {
         match arg.as_str() {
@@ -59,6 +137,7 @@ async fn run() -> Result<i32> {
             "--setup-status" => status=true,
             "--retry" => retry=true,
             "--no-provision" => no_provision=true,
+            "--worker" => worker=true,
             "--" => {command.extend(args);break;},
             _ => bail!("unknown supervisor argument: {arg}"),
         }
@@ -67,7 +146,7 @@ async fn run() -> Result<i32> {
     let state=match state {Some(path)=>path,None=>default_state_directory()?};
     if !state.is_absolute() {bail!("state must be absolute")}
     if setup || status {
-        if setup && status || retry && !setup || policy.is_some() || !command.is_empty() || tty {bail!("setup/status must not include a command or policy")}
+        if setup && status || retry && !setup || policy.is_some() || !command.is_empty() || tty || worker {bail!("setup/status must not include a command or policy")}
         if setup {
             let permissions=codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile(&PermissionProfile::read_only())?;
             let mut env:HashMap<String,String>=std::env::vars().collect();
@@ -86,7 +165,10 @@ async fn run() -> Result<i32> {
     // The installation state is never part of a project command's writable surface.
     p.denied_write_paths.push(state.clone());
     p.denied_write_paths.push(default_state_directory()?);
-    if command.is_empty() {bail!("missing command")}
+    if worker {
+        if !command.is_empty() || tty {bail!("a worker receives its commands on stdin")}
+        if p.mode!="read_only" || p.network.egress || p.network.local_binding {bail!("a worker runs only read-only commands without network access")}
+    } else if command.is_empty() {bail!("missing command")}
     if !state.is_absolute() || !cwd.is_absolute() {bail!("state and cwd must be absolute")}
     if !matches!(p.mode.as_str(),"read_only"|"workspace_write"|"auto") {bail!("unsupported restricted mode: {}",p.mode)}
     if !p.network.allowed_hosts.is_empty() || p.network.outgoing_proxy.is_some() {bail!("Windows host allowlist proxy is not available in this build")}
@@ -150,6 +232,21 @@ async fn run() -> Result<i32> {
     let mut read_roots=vec![cwd.clone()];
     read_roots.extend(p.allowed_read_paths);
     read_roots.extend(write_roots.iter().cloned());
+    if worker {
+        let runner=spawn_windows_sandbox_served_runner(WindowsSandboxSessionRequest {
+            permission_profile:&profile, workspace_roots:&roots, codex_home:&state,
+            command:vec!["happy-sandbox-worker".into()], cwd:&cwd, env_map:env, windows_sandbox_level:WindowsSandboxLevel::Elevated,
+            proxy_enforced:false, network_proxy_restricting_sid:None,
+            proxy_settings_mode:WindowsSandboxProxySettingsMode::Reconcile,
+            timeout_ms:None, read_roots_override:Some(&read_roots), read_roots_include_platform_defaults:false,
+            write_roots_override:Some(&write_roots), deny_read_paths_override:&denied_read,
+            deny_write_paths_override:&denied_write, tty:false, stdin_open:false, use_private_desktop:true,
+        }).await?;
+        // The scratch directory lives exactly as long as the worker that writes to it.
+        let code=serve_worker(runner)?;
+        drop(temporary);
+        return Ok(code);
+    }
     let spawned=spawn_windows_sandbox_session_for_level(WindowsSandboxSessionRequest {
         permission_profile:&profile, workspace_roots:&roots, codex_home:&state,
         command, cwd:&cwd, env_map:env, windows_sandbox_level:WindowsSandboxLevel::Elevated,

@@ -373,10 +373,32 @@ index 1e3c88b..54f4755 100644
 +    panic!("happy-sandbox-runner is Windows-only");
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
-index b380aa0..58956f1 100644
+index b380aa0..f35c598 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
 +++ b/codex-rs/windows-sandbox-rs/src/bin/command_runner/win.rs
-@@ -77,7 +77,7 @@ use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+@@ -31,6 +31,7 @@ use codex_windows_sandbox::OutputStream;
+ use codex_windows_sandbox::PipeSpawnHandles;
+ use codex_windows_sandbox::ResizePayload;
+ use codex_windows_sandbox::SpawnReady;
++use codex_windows_sandbox::ServedFrame;
+ use codex_windows_sandbox::SpawnRequest;
+ use codex_windows_sandbox::StderrMode;
+ use codex_windows_sandbox::StdinMode;
+@@ -45,10 +46,13 @@ use codex_windows_sandbox::hide_current_user_profile_dir;
+ use codex_windows_sandbox::log_note;
+ use codex_windows_sandbox::read_frame;
+ use codex_windows_sandbox::read_handle_loop;
++use codex_windows_sandbox::read_served_frame;
+ use codex_windows_sandbox::spawn_process_with_pipes;
+ use codex_windows_sandbox::to_wide;
+ use codex_windows_sandbox::token_mode_for_permission_profile;
+ use codex_windows_sandbox::write_frame;
++use codex_windows_sandbox::write_served_frame;
++use std::collections::HashMap;
+ use std::ffi::OsStr;
+ use std::fs::File;
+ use std::os::windows::io::FromRawHandle;
+@@ -77,7 +81,7 @@ use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
  use windows_sys::Win32::System::Threading::TerminateProcess;
  use windows_sys::Win32::System::Threading::WaitForSingleObject;
  
@@ -385,6 +407,398 @@ index b380aa0..58956f1 100644
  const TERMINATION_WAIT_MS: u32 = 5_000;
  const WAIT_TIMEOUT: u32 = 0x0000_0102;
  
+@@ -542,15 +546,380 @@ fn spawn_input_loop(
+     })
+ }
+ 
++/// Write one frame of a served command's conversation (Happy).
++fn write_served(writer: &Arc<StdMutex<File>>, id: u64, message: Message) -> Result<()> {
++    let frame = ServedFrame {
++        id,
++        keep_descendants: false,
++        frame: FramedMessage {
++            version: IPC_PROTOCOL_VERSION,
++            message,
++        },
++    };
++    let mut guard = writer
++        .lock()
++        .map_err(|_| anyhow::anyhow!("runner pipe writer lock poisoned"))?;
++    write_served_frame(&mut *guard, &frame)
++}
++
++fn send_served_error(writer: &Arc<StdMutex<File>>, id: u64, stage: ErrorStage, err: &anyhow::Error) {
++    let _ = write_served(
++        writer,
++        id,
++        Message::Error {
++            payload: ErrorPayload {
++                message: err.to_string(),
++                stage,
++                windows_error_code: windows_error_code(err),
++            },
++        },
++    );
++}
++
++/// Forward bytes to a child's stdin, closing it if the child stops accepting input.
++///
++/// `WriteFile` can consume only part of a buffer on a pipe, so writing continues until every byte
++/// is forwarded. A failed or stalled write closes our end instead of retrying forever.
++fn write_child_stdin(stdin: &mut Option<HANDLE>, bytes: &[u8], log_dir: Option<&Path>) {
++    let Some(handle) = *stdin else {
++        return;
++    };
++    let mut offset = 0usize;
++    while offset < bytes.len() {
++        let chunk = &bytes[offset..];
++        let mut written = 0u32;
++        let ok = unsafe {
++            windows_sys::Win32::Storage::FileSystem::WriteFile(
++                handle,
++                chunk.as_ptr(),
++                chunk.len().min(u32::MAX as usize) as u32,
++                &mut written,
++                ptr::null_mut(),
++            )
++        };
++        if ok == 0 || written == 0 {
++            log_note(
++                &format!("runner stdin write stopped after {offset} bytes; closing child stdin"),
++                log_dir,
++            );
++            unsafe {
++                CloseHandle(handle);
++            }
++            *stdin = None;
++            return;
++        }
++        offset += written as usize;
++    }
++}
++
++/// What the dispatcher keeps for a served command while it runs.
++struct ServedCommand {
++    /// Stdin, resize, and terminate frames, handled by the command's own thread.
++    controls: std::sync::mpsc::Sender<Message>,
++    /// The command's job once it has started, so a stop never waits behind blocked stdin.
++    job: Arc<StdMutex<Option<Arc<JobObject>>>>,
++}
++
++type ServedCommands = Arc<StdMutex<HashMap<u64, ServedCommand>>>;
++
++fn forget_served(commands: &ServedCommands, id: u64) {
++    if let Ok(mut commands) = commands.lock() {
++        commands.remove(&id);
++    }
++}
++
++/// Runs one served command from spawn to exit on its own thread (Happy).
++///
++/// Mirrors the one-shot runner: the command gets its own restricted token, job, pipes or
++/// pseudo-console, and timeout. Its frames carry its id so commands can share the pipes.
++fn run_served_command(
++    id: u64,
++    req: SpawnRequest,
++    keep_descendants: bool,
++    controls: std::sync::mpsc::Receiver<Message>,
++    job_slot: Arc<StdMutex<Option<Arc<JobObject>>>>,
++    writer: Arc<StdMutex<File>>,
++    commands: ServedCommands,
++) {
++    let spawned = match spawn_ipc_process(&req) {
++        Ok(value) => value,
++        Err(err) => {
++            forget_served(&commands, id);
++            send_served_error(&writer, id, ErrorStage::SpawnChild, &err);
++            return;
++        }
++    };
++    let IpcSpawnedProcess {
++        log_dir,
++        pi,
++        job,
++        stdout_handle,
++        stderr_handle,
++        mut stdin_handle,
++        conpty_owner,
++        hpc_handle,
++        _pipe_handles,
++    } = spawned;
++    let log_dir = Some(log_dir);
++    if let Ok(mut slot) = job_slot.lock() {
++        *slot = Some(Arc::clone(&job));
++    }
++    let _ = write_served(
++        &writer,
++        id,
++        Message::SpawnReady {
++            payload: SpawnReady {
++                process_id: unsafe { GetProcessId(pi.hProcess) },
++            },
++        },
++    );
++    let reader = |handle: HANDLE, stream: OutputStream| {
++        let writer = Arc::clone(&writer);
++        let log_dir = log_dir.clone();
++        read_handle_loop(handle, move |chunk| {
++            let message = Message::Output {
++                payload: OutputPayload {
++                    data_b64: encode_bytes(chunk),
++                    stream,
++                },
++            };
++            if let Err(err) = write_served(&writer, id, message) {
++                log_note(
++                    &format!("runner output write failed: {err}"),
++                    log_dir.as_deref(),
++                );
++            }
++        })
++    };
++    let out_thread = reader(stdout_handle, OutputStream::Stdout);
++    let err_thread =
++        (stderr_handle != INVALID_HANDLE_VALUE).then(|| reader(stderr_handle, OutputStream::Stderr));
++
++    let deadline = req
++        .timeout_ms
++        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
++    let mut timed_out = false;
++    let mut stopped = false;
++    'running: loop {
++        if unsafe { WaitForSingleObject(pi.hProcess, 50) } != WAIT_TIMEOUT {
++            break;
++        }
++        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
++            timed_out = true;
++            stopped = true;
++            terminate_job_or_process(&job, pi.hProcess, log_dir.as_deref());
++            unsafe { WaitForSingleObject(pi.hProcess, TERMINATION_WAIT_MS) };
++            break;
++        }
++        loop {
++            match controls.try_recv() {
++                Ok(Message::Stdin { payload }) => {
++                    if let Ok(bytes) = decode_bytes(&payload.data_b64) {
++                        write_child_stdin(&mut stdin_handle, &bytes, log_dir.as_deref());
++                    }
++                }
++                Ok(Message::CloseStdin { .. }) => {
++                    if let Some(handle) = stdin_handle.take() {
++                        unsafe {
++                            CloseHandle(handle);
++                        }
++                    }
++                }
++                Ok(Message::Resize {
++                    payload: ResizePayload { rows, cols },
++                }) => {
++                    if let Some(hpc) = hpc_handle {
++                        unsafe {
++                            let _ = ResizePseudoConsole(
++                                hpc,
++                                COORD {
++                                    X: cols as i16,
++                                    Y: rows as i16,
++                                },
++                            );
++                        }
++                    }
++                }
++                Ok(Message::Terminate { .. }) => {
++                    stopped = true;
++                    terminate_job_or_process(&job, pi.hProcess, log_dir.as_deref());
++                }
++                Ok(_) => {}
++                Err(std::sync::mpsc::TryRecvError::Empty) => break,
++                // The parent is gone, and with it everyone who could read this command's output.
++                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                    stopped = true;
++                    terminate_job_or_process(&job, pi.hProcess, log_dir.as_deref());
++                    unsafe { WaitForSingleObject(pi.hProcess, TERMINATION_WAIT_MS) };
++                    break 'running;
++                }
++            }
++        }
++    }
++    // A command that ended on its own may leave work running when asked to, exactly as a one-shot
++    // command does. Otherwise nothing it started outlives it: a leftover process would keep its
++    // output pipes open, and nothing would ever collect it.
++    let outcome = if keep_descendants && !stopped {
++        job.preserve_descendants()
++    } else {
++        job.terminate()
++    };
++    if let Err(err) = outcome {
++        log_note(
++            &format!("runner failed to settle a served command's process tree: {err}"),
++            log_dir.as_deref(),
++        );
++    }
++    if let Some(handle) = stdin_handle.take() {
++        unsafe {
++            CloseHandle(handle);
++        }
++    }
++    let mut exit_code: u32 = 1;
++    unsafe {
++        GetExitCodeProcess(pi.hProcess, &mut exit_code);
++        if pi.hThread != 0 {
++            CloseHandle(pi.hThread);
++        }
++        if pi.hProcess != 0 {
++            CloseHandle(pi.hProcess);
++        }
++    }
++    // Closing the pseudo-console flushes and ends its output, so the reader can finish.
++    drop(conpty_owner);
++    let _ = out_thread.join();
++    if let Some(thread) = err_thread {
++        let _ = thread.join();
++    }
++    drop(_pipe_handles);
++    forget_served(&commands, id);
++    let _ = write_served(
++        &writer,
++        id,
++        Message::Exit {
++            payload: ExitPayload {
++                exit_code: if timed_out { 128 + 64 } else { exit_code as i32 },
++                timed_out,
++            },
++        },
++    );
++}
++
++/// Runs many commands at once over the same pipes until the parent closes them (Happy).
++///
++/// The parent pays for one logon, one private desktop, and one setup refresh, instead of one of
++/// each per command. Every frame names its command, and every command gets its own thread,
++/// restricted token, and job, so a slow or blocked command never holds up another. When the
++/// parent closes the pipes, every command still running is stopped before this process exits.
++fn serve(mut pipe_read: File, pipe_write: Arc<StdMutex<File>>) -> Result<()> {
++    let commands: ServedCommands = Arc::new(StdMutex::new(HashMap::new()));
++    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
++    loop {
++        let ServedFrame {
++            id,
++            keep_descendants,
++            frame,
++        } = match read_served_frame(&mut pipe_read) {
++            Ok(Some(frame)) => frame,
++            Ok(None) | Err(_) => break,
++        };
++        if frame.version != IPC_PROTOCOL_VERSION {
++            send_served_error(
++                &pipe_write,
++                id,
++                ErrorStage::ReadSpawnRequest,
++                &anyhow::anyhow!("runner: unsupported protocol version {}", frame.version),
++            );
++            continue;
++        }
++        match frame.message {
++            Message::SpawnRequest { payload } => {
++                let (controls, received) = std::sync::mpsc::channel();
++                let job = Arc::new(StdMutex::new(None));
++                {
++                    let mut running = commands
++                        .lock()
++                        .map_err(|_| anyhow::anyhow!("runner command table lock poisoned"))?;
++                    if running.contains_key(&id) {
++                        drop(running);
++                        send_served_error(
++                            &pipe_write,
++                            id,
++                            ErrorStage::ReadSpawnRequest,
++                            &anyhow::anyhow!("runner: command {id} is already running"),
++                        );
++                        continue;
++                    }
++                    running.insert(
++                        id,
++                        ServedCommand {
++                            controls,
++                            job: Arc::clone(&job),
++                        },
++                    );
++                }
++                let writer = Arc::clone(&pipe_write);
++                let commands = Arc::clone(&commands);
++                threads.retain(|thread| !thread.is_finished());
++                threads.push(std::thread::spawn(move || {
++                    run_served_command(id, *payload, keep_descendants, received, job, writer, commands)
++                }));
++            }
++            message @ (Message::Stdin { .. }
++            | Message::CloseStdin { .. }
++            | Message::Resize { .. }
++            | Message::Terminate { .. }) => {
++                let Ok(running) = commands.lock() else {
++                    continue;
++                };
++                // A control frame for a command that already ended has nothing left to act on.
++                let Some(command) = running.get(&id) else {
++                    continue;
++                };
++                // Stop the tree here as well: the command's own thread may be blocked writing
++                // stdin the child never reads.
++                if matches!(message, Message::Terminate { .. })
++                    && let Ok(job) = command.job.lock()
++                    && let Some(job) = job.as_ref()
++                {
++                    let _ = job.terminate();
++                }
++                let _ = command.controls.send(message);
++            }
++            Message::SpawnReady { .. }
++            | Message::Output { .. }
++            | Message::Exit { .. }
++            | Message::Error { .. } => {}
++        }
++    }
++    // The parent is gone. Stop every command, then wait for each to release what it holds.
++    if let Ok(mut running) = commands.lock() {
++        for (_, command) in running.drain() {
++            if let Ok(job) = command.job.lock()
++                && let Some(job) = job.as_ref()
++            {
++                let _ = job.terminate();
++            }
++        }
++    }
++    for thread in threads {
++        let _ = thread.join();
++    }
++    Ok(())
++}
++
+ /// Entry point for the Windows command runner process.
+ pub fn main() -> Result<()> {
+     let mut pipe_in = None;
+     let mut pipe_out = None;
++    let mut served = false;
+     for arg in std::env::args().skip(1) {
+         if let Some(rest) = arg.strip_prefix("--pipe-in=") {
+             pipe_in = Some(rest.to_string());
+         } else if let Some(rest) = arg.strip_prefix("--pipe-out=") {
+             pipe_out = Some(rest.to_string());
++        } else if arg == "--serve" {
++            served = true;
+         }
+     }
+ 
+@@ -570,6 +939,10 @@ pub fn main() -> Result<()> {
+     let pipe_write = Arc::new(StdMutex::new(unsafe {
+         File::from_raw_handle(h_pipe_out.into_raw() as _)
+     }));
++    if served {
++        serve(pipe_read, pipe_write)?;
++        std::process::exit(0);
++    }
+ 
+     let req = match read_spawn_request(&mut pipe_read) {
+         Ok(v) => v,
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs
 index 2624607..40189d0 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs
@@ -925,10 +1339,95 @@ index 2c8f35c..26977bf 100644
          assert!(LaunchDesktop::open_private(name).is_err(), "{name:?}");
      }
 diff --git a/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs b/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
-index 1b1766a..47948ee 100644
+index 1b1766a..589c17c 100644
 --- a/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
 +++ b/codex-rs/windows-sandbox-rs/src/elevated/ipc_framed.rs
-@@ -207,7 +207,7 @@ mod tests {
+@@ -30,6 +30,21 @@ pub struct FramedMessage {
+     pub message: Message,
+ }
+ 
++/// One frame of a served runner's conversation (Happy).
++///
++/// A served runner runs many commands at once over one pair of pipes, so every frame in either
++/// direction names the command it belongs to with the id the parent chose for it.
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct ServedFrame {
++    pub id: u64,
++    /// On a `SpawnRequest`: let processes the command started keep running after it exits, as a
++    /// one-shot runner does. Otherwise the command's whole process tree ends with it.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub keep_descendants: bool,
++    #[serde(flatten)]
++    pub frame: FramedMessage,
++}
++
+ /// IPC message variants exchanged between parent and runner.
+ ///
+ /// `SpawnRequest`, `Stdin`, `CloseStdin`, `Resize`, and `Terminate` are parent->runner commands.
+@@ -154,6 +169,16 @@ pub fn read_frame<R: Read>(reader: R) -> Result<Option<FramedMessage>> {
+     crate::framed_io::read_frame(reader)
+ }
+ 
++/// Write a length-prefixed served frame (Happy).
++pub fn write_served_frame<W: Write>(writer: W, frame: &ServedFrame) -> Result<()> {
++    crate::framed_io::write_frame(writer, frame)
++}
++
++/// Read a length-prefixed served frame; returns `Ok(None)` on EOF (Happy).
++pub fn read_served_frame<R: Read>(reader: R) -> Result<Option<ServedFrame>> {
++    crate::framed_io::read_frame(reader)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -184,6 +209,45 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn served_frame_names_its_command_beside_the_message() {
++        let frame = ServedFrame {
++            id: 42,
++            keep_descendants: false,
++            frame: FramedMessage {
++                version: IPC_PROTOCOL_VERSION,
++                message: Message::Exit {
++                    payload: ExitPayload {
++                        exit_code: 3,
++                        timed_out: false,
++                    },
++                },
++            },
++        };
++        let encoded = serde_json::to_value(&frame).expect("serialize");
++        assert_eq!(
++            serde_json::json!({
++                "id": 42,
++                "version": IPC_PROTOCOL_VERSION,
++                "type": "exit",
++                "payload": {"exit_code": 3, "timed_out": false},
++            }),
++            encoded
++        );
++
++        let mut buf = Vec::new();
++        write_served_frame(&mut buf, &ServedFrame { keep_descendants: true, ..frame })
++            .expect("write");
++        let decoded = read_served_frame(buf.as_slice()).expect("read").expect("some");
++        assert_eq!(42, decoded.id);
++        assert!(decoded.keep_descendants);
++        let Message::Exit { payload } = decoded.frame.message else {
++            panic!("unexpected message");
++        };
++        assert_eq!(3, payload.exit_code);
++        assert!(read_served_frame([].as_slice()).expect("eof").is_none());
++    }
++
+     #[test]
+     fn spawn_request_serializes_permission_profile() {
+         let workspace_roots = vec![
+@@ -207,7 +271,7 @@ mod tests {
                      tty: false,
                      stdin_open: false,
                      use_private_desktop: true,
@@ -937,7 +1436,7 @@ index 1b1766a..47948ee 100644
                  }),
              },
          };
-@@ -226,7 +226,7 @@ mod tests {
+@@ -226,7 +290,7 @@ mod tests {
          assert_eq!(PermissionProfile::read_only(), payload.permission_profile);
          assert_eq!(workspace_roots, payload.workspace_roots);
          assert_eq!(
@@ -947,10 +1446,19 @@ index 1b1766a..47948ee 100644
          );
          assert_eq!(
 diff --git a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
-index 697ad33..5c38dea 100644
+index 697ad33..5b0083f 100644
 --- a/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
 +++ b/codex-rs/windows-sandbox-rs/src/elevated/runner_client.rs
-@@ -214,7 +214,7 @@ fn connect_pipe_with_timeout(
+@@ -96,6 +96,8 @@ impl std::error::Error for RunnerStartupError {}
+ pub(crate) struct RunnerTransport {
+     pipe_write: File,
+     pipe_read: File,
++    /// The private desktop every command from this runner starts on, when one was requested.
++    pub(crate) private_desktop_name: Option<String>,
+ }
+ 
+ fn is_refreshable_windows_error(code: u32) -> bool {
+@@ -214,7 +216,7 @@ fn connect_pipe_with_timeout(
      let (connect_result_tx, connect_result_rx) = mpsc::sync_channel(1);
      let mut connect_thread = Some(
          thread::Builder::new()
@@ -959,16 +1467,44 @@ index 697ad33..5c38dea 100644
              .spawn(move || {
                  let current_process = unsafe { GetCurrentProcess() };
                  let mut thread_handle = 0;
-@@ -336,7 +336,7 @@ pub(crate) fn spawn_runner_transport(
+@@ -322,6 +324,7 @@ pub(crate) fn spawn_runner_transport(
+     log_dir: Option<&Path>,
+     mut spawn_request: SpawnRequest,
+     desktop_policy: Option<&DesktopPolicy>,
++    serve: bool,
+ ) -> Result<RunnerTransport> {
+     spawn_request.private_desktop_name = desktop_policy
+         .map(|policy| shared_private_desktop_for_user(&sandbox_creds.username, policy, log_dir))
+@@ -336,16 +339,24 @@ pub(crate) fn spawn_runner_transport(
      let runner_cmdline = runner_exe
          .to_str()
          .map(str::to_owned)
 -        .unwrap_or_else(|| "codex-command-runner.exe".to_string());
 +        .unwrap_or_else(|| "happy-sandbox-runner.exe".to_string());
      let runner_full_cmd = format!(
-         "{} {} {}",
+-        "{} {} {}",
++        "{} {} {}{}",
          quote_windows_arg(&runner_cmdline),
-@@ -405,7 +405,7 @@ pub(crate) fn spawn_runner_transport(
+         quote_windows_arg(&format!("--pipe-in={pipe_in_name}")),
+-        quote_windows_arg(&format!("--pipe-out={pipe_out_name}"))
++        quote_windows_arg(&format!("--pipe-out={pipe_out_name}")),
++        if serve { " --serve" } else { "" }
+     );
+     let mut cmdline_vec = to_wide(&runner_full_cmd);
+     let exe_w = to_wide(&runner_cmdline);
+-    let cwd_w = to_wide(cwd);
++    // A long-lived serving runner must not hold the workspace as its working directory, because
++    // Windows keeps a process's working directory from being deleted. Each spawn request still
++    // runs its command in the requested directory.
++    let process_cwd = match runner_exe.parent() {
++        Some(directory) if serve => directory,
++        _ => cwd,
++    };
++    let cwd_w = to_wide(process_cwd);
+     let user_w = to_wide(&sandbox_creds.username);
+     let domain_w = to_wide(".");
+     let password_w = to_wide(&sandbox_creds.password);
+@@ -405,7 +416,7 @@ pub(crate) fn spawn_runner_transport(
          unsafe {
              // Keep the process handle alive until the pipe handshake finishes. If the handshake
              // fails after the runner process has already launched, we still need a way to stop
@@ -977,7 +1513,22 @@ index 697ad33..5c38dea 100644
              if pi.hProcess != 0 {
                  let _ = TerminateProcess(pi.hProcess, 1);
                  CloseHandle(pi.hProcess);
-@@ -425,7 +425,7 @@ pub(crate) fn spawn_runner_transport(
+@@ -421,11 +432,22 @@ pub(crate) fn spawn_runner_transport(
+         // From here on, the `RunnerTransport` owns closing the pipes on every success/error path.
+         pipe_write: unsafe { File::from_raw_handle(h_pipe_in as _) },
+         pipe_read: unsafe { File::from_raw_handle(h_pipe_out as _) },
++        private_desktop_name: spawn_request.private_desktop_name.clone(),
+     };
++    if serve {
++        // A serving runner waits for its first request; there is no spawn to acknowledge yet.
++        // The pipes are now its only lifetime anchor: closing them ends it.
++        unsafe {
++            if pi.hProcess != 0 {
++                CloseHandle(pi.hProcess);
++            }
++        }
++        return Ok(transport);
++    }
      let startup_result = (|| -> Result<()> {
          // Keep the runner process HANDLE alive until the *entire* startup handshake finishes.
          // That way, a later `send_spawn_request` or `spawn_ready` failure can still terminate the
@@ -999,6 +1550,18 @@ index c8ae092..5bfcd9d 100644
      (format!("{base}-in"), format!("{base}-out"))
  }
  
+diff --git a/codex-rs/windows-sandbox-rs/src/elevated_impl.rs b/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
+index 702884a..ef0427d 100644
+--- a/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
++++ b/codex-rs/windows-sandbox-rs/src/elevated_impl.rs
+@@ -235,6 +235,7 @@ mod windows_impl {
+                         logs_base_dir,
+                         spawn_request.clone(),
+                         desktop_policy.as_ref(),
++                        /*serve*/ false,
+                     )
+                 },
+                 || {
 diff --git a/codex-rs/windows-sandbox-rs/src/happy_setup_gate.rs b/codex-rs/windows-sandbox-rs/src/happy_setup_gate.rs
 new file mode 100644
 index 0000000..cca41ff
@@ -1674,7 +2237,7 @@ index 6f3a66d..ab723fb 100644
      fn remove_sandbox_users_file_deletes_existing_file() {
          let codex_home = TempDir::new().expect("tempdir");
 diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
-index e83a42a..ee49c67 100644
+index e83a42a..4e31ab2 100644
 --- a/codex-rs/windows-sandbox-rs/src/lib.rs
 +++ b/codex-rs/windows-sandbox-rs/src/lib.rs
 @@ -79,6 +79,8 @@ mod hide_users;
@@ -1697,7 +2260,24 @@ index e83a42a..ee49c67 100644
  pub use identity::sandbox_setup_is_complete_with_settings;
  #[cfg(target_os = "windows")]
  pub use ipc_framed::ErrorPayload;
-@@ -339,6 +345,8 @@ pub use setup::run_elevated_provisioning_setup_with_retained_handles;
+@@ -259,6 +265,16 @@ pub use ipc_framed::read_frame;
+ #[cfg(target_os = "windows")]
+ pub use ipc_framed::write_frame;
+ #[cfg(target_os = "windows")]
++pub use ipc_framed::ServedFrame;
++#[cfg(target_os = "windows")]
++pub use ipc_framed::StdinPayload;
++#[cfg(target_os = "windows")]
++pub use ipc_framed::read_served_frame;
++#[cfg(target_os = "windows")]
++pub use ipc_framed::write_served_frame;
++#[cfg(target_os = "windows")]
++pub use spawn_prep::normalize_served_command_env;
++#[cfg(target_os = "windows")]
+ pub use logging::current_log_file_path;
+ #[cfg(target_os = "windows")]
+ pub use logging::current_log_file_path_for_codex_home;
+@@ -339,6 +355,8 @@ pub use setup::run_elevated_provisioning_setup_with_retained_handles;
  #[cfg(target_os = "windows")]
  pub use setup::run_elevated_setup;
  #[cfg(target_os = "windows")]
@@ -1706,6 +2286,17 @@ index e83a42a..ee49c67 100644
  pub use setup::run_setup_refresh;
  #[cfg(target_os = "windows")]
  pub use setup::run_setup_refresh_with_extra_read_roots;
+@@ -392,6 +410,10 @@ pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_prof
+ #[cfg(target_os = "windows")]
+ pub use unified_exec::spawn_windows_sandbox_session_for_level;
+ #[cfg(target_os = "windows")]
++pub use unified_exec::WindowsSandboxServedRunner;
++#[cfg(target_os = "windows")]
++pub use unified_exec::spawn_windows_sandbox_served_runner;
++#[cfg(target_os = "windows")]
+ pub use unified_exec::spawn_windows_sandbox_session_legacy;
+ #[cfg(target_os = "windows")]
+ pub use uninstall_windows::clean_up_packaged_windows_sandbox;
 diff --git a/codex-rs/windows-sandbox-rs/src/path_normalization.rs b/codex-rs/windows-sandbox-rs/src/path_normalization.rs
 index 1735b74..5a38d33 100644
 --- a/codex-rs/windows-sandbox-rs/src/path_normalization.rs
@@ -2078,6 +2669,28 @@ index dcb8f6f..13de6ed 100644
      let handle = unsafe {
          CreateMutexW(&attributes, /*binitialowner*/ 0, name.as_ptr())
      };
+diff --git a/codex-rs/windows-sandbox-rs/src/spawn_prep.rs b/codex-rs/windows-sandbox-rs/src/spawn_prep.rs
+index 9479c0b..49ccd23 100644
+--- a/codex-rs/windows-sandbox-rs/src/spawn_prep.rs
++++ b/codex-rs/windows-sandbox-rs/src/spawn_prep.rs
+@@ -345,6 +345,17 @@ pub(crate) fn apply_legacy_session_acl_rules(
+     Ok(())
+ }
+ 
++/// Make a served command's environment what a one-shot command's would be (Happy).
++///
++/// A served runner prepares its sandbox once, but every command brings its own environment, so
++/// the adjustments the one-shot path makes while preparing are applied to each command instead.
++pub fn normalize_served_command_env(env_map: &mut HashMap<String, String>, cwd: &Path) {
++    normalize_null_device_env(env_map);
++    ensure_non_interactive_pager(env_map);
++    inherit_path_env(env_map);
++    inject_git_safe_directory(env_map, cwd);
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
+     permissions: ResolvedWindowsSandboxPermissions,
 diff --git a/codex-rs/windows-sandbox-rs/src/stdio_bridge.rs b/codex-rs/windows-sandbox-rs/src/stdio_bridge.rs
 index 3ad722b..902f648 100644
 --- a/codex-rs/windows-sandbox-rs/src/stdio_bridge.rs
@@ -2233,7 +2846,7 @@ index c13632b..fd68932 100644
 +    Ok(())
 +}
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
-index 0d7d2ca..d378011 100644
+index 0d7d2ca..023df38 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
 +++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/elevated.rs
 @@ -24,7 +24,6 @@ use codex_utils_pty::SpawnedProcess;
@@ -2244,7 +2857,28 @@ index 0d7d2ca..d378011 100644
  use tokio::sync::mpsc;
  use tokio::sync::oneshot;
  
-@@ -229,11 +228,11 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
+@@ -95,6 +94,7 @@ fn spawn_runner_transport_with_retry<T>(
+ async fn spawn_runner_transport_task(
+     sandbox_creds: SandboxCreds,
+     request: RunnerTransportRequest,
++    serve: bool,
+ ) -> Result<RunnerTransport> {
+     tokio::task::spawn_blocking(move || -> Result<_> {
+         let desktop_policy = request
+@@ -136,6 +136,7 @@ async fn spawn_runner_transport_task(
+                     log_dir,
+                     spawn_request,
+                     desktop_policy.as_ref(),
++                    serve,
+                 )
+             },
+             refresh_logon_sandbox_creds,
+@@ -225,15 +226,15 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
+         proxy_enforced,
+         proxy_settings_mode,
+     };
+-    let transport = spawn_runner_transport_task(sandbox_creds, request).await?;
++    let transport = spawn_runner_transport_task(sandbox_creds, request, /*serve*/ false).await?;
      let (pipe_write, pipe_read) = transport.into_files();
  
      let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -2258,6 +2892,113 @@ index 0d7d2ca..d378011 100644
      };
      let (exit_tx, exit_rx) = oneshot::channel::<i32>();
  
+@@ -277,6 +278,106 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
+     ))
+ }
+ 
++/// One logged-on runner that serves many commands, one at a time (Happy).
++///
++/// The setup refresh, the logon, and the private desktop happen once here instead of once per
++/// command. Send each command as a `SpawnRequest` cloned from `template` with its own `command`
++/// and `timeout_ms`, then read frames until its `Exit` or `Error`. Dropping the pipes ends the
++/// runner and every command it is still running.
++pub struct WindowsSandboxServedRunner {
++    pub pipe_write: std::fs::File,
++    pub pipe_read: std::fs::File,
++    pub template: SpawnRequest,
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) async fn spawn_windows_sandbox_served_runner(
++    permission_profile: &PermissionProfile,
++    workspace_roots: &[AbsolutePathBuf],
++    codex_home: &Path,
++    command: Vec<String>,
++    cwd: &Path,
++    mut env_map: HashMap<String, String>,
++    read_roots_override: Option<&[PathBuf]>,
++    read_roots_include_platform_defaults: bool,
++    write_roots_override: Option<&[PathBuf]>,
++    deny_read_paths_override: &[AbsolutePathBuf],
++    deny_write_paths_override: &[AbsolutePathBuf],
++    use_private_desktop: bool,
++) -> Result<WindowsSandboxServedRunner> {
++    let deny_read_paths_override = deny_read_paths_override
++        .iter()
++        .map(AbsolutePathBuf::to_path_buf)
++        .collect::<Vec<_>>();
++    let deny_write_paths_override = deny_write_paths_override
++        .iter()
++        .map(AbsolutePathBuf::to_path_buf)
++        .collect::<Vec<_>>();
++    let permissions =
++        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
++            permission_profile,
++            workspace_roots,
++        )?;
++    let proxy_settings_mode = crate::WindowsSandboxProxySettingsMode::Reconcile;
++    let elevated = prepare_elevated_spawn_context_for_permissions(
++        permissions.clone(),
++        codex_home,
++        cwd,
++        &mut env_map,
++        &command,
++        read_roots_override,
++        read_roots_include_platform_defaults,
++        write_roots_override,
++        &deny_read_paths_override,
++        &deny_write_paths_override,
++        /*proxy_enforced*/ false,
++        proxy_settings_mode,
++    )?;
++    let template = SpawnRequest {
++        command,
++        cwd: cwd.to_path_buf(),
++        env: env_map.clone(),
++        permission_profile: permission_profile.clone(),
++        workspace_roots: workspace_roots.to_vec(),
++        codex_home: elevated.sandbox_base,
++        real_codex_home: codex_home.to_path_buf(),
++        cap_sids: elevated.cap_sids,
++        network_proxy_restricting_sid: None,
++        timeout_ms: None,
++        tty: false,
++        stdin_open: false,
++        use_private_desktop,
++        private_desktop_name: None,
++    };
++    let request = RunnerTransportRequest {
++        permissions,
++        codex_home: codex_home.to_path_buf(),
++        cwd: cwd.to_path_buf(),
++        env_map,
++        logs_base_dir: elevated.logs_base_dir,
++        spawn_request: template.clone(),
++        read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
++        read_roots_include_platform_defaults,
++        write_roots_override: write_roots_override.map(<[PathBuf]>::to_vec),
++        deny_read_paths_override,
++        deny_write_paths_override,
++        proxy_enforced: false,
++        proxy_settings_mode,
++    };
++    let transport =
++        spawn_runner_transport_task(elevated.sandbox_creds, request, /*serve*/ true).await?;
++    let template = SpawnRequest {
++        private_desktop_name: transport.private_desktop_name.clone(),
++        ..template
++    };
++    let (pipe_write, pipe_read) = transport.into_files();
++    Ok(WindowsSandboxServedRunner {
++        pipe_write,
++        pipe_read,
++        template,
++    })
++}
++
+ #[cfg(test)]
+ #[path = "elevated_tests.rs"]
+ mod tests;
 diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs
 index f37829e..903e361 100644
 --- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/windows_common.rs
@@ -2353,6 +3094,48 @@ index f37829e..903e361 100644
 +        let _ = stdout_tx.blocking_send(formatted);
      }
  }
+diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs
+index 4e6020a..cebb2dc 100644
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/mod.rs
+@@ -97,6 +97,37 @@ pub async fn spawn_windows_sandbox_session_for_level(
+     }
+ }
+ 
++pub use backends::elevated::WindowsSandboxServedRunner;
++
++/// Starts one elevated runner that serves many pipe commands without a terminal (Happy).
++pub async fn spawn_windows_sandbox_served_runner(
++    request: WindowsSandboxSessionRequest<'_>,
++) -> Result<WindowsSandboxServedRunner> {
++    if !matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated)
++        || request.proxy_enforced
++        || request.network_proxy_restricting_sid.is_some()
++        || request.tty
++        || request.stdin_open
++    {
++        bail!("a served runner requires the elevated backend without proxying, a terminal, or input");
++    }
++    backends::elevated::spawn_windows_sandbox_served_runner(
++        request.permission_profile,
++        request.workspace_roots,
++        request.codex_home,
++        request.command,
++        request.cwd,
++        request.env_map,
++        request.read_roots_override,
++        request.read_roots_include_platform_defaults,
++        request.write_roots_override,
++        request.deny_read_paths_override,
++        request.deny_write_paths_override,
++        request.use_private_desktop,
++    )
++    .await
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub async fn spawn_windows_sandbox_session_legacy(
+     permission_profile: &PermissionProfile,
 diff --git a/codex-rs/windows-sandbox-rs/src/uninstall_windows.rs b/codex-rs/windows-sandbox-rs/src/uninstall_windows.rs
 index ff5b779..4587143 100644
 --- a/codex-rs/windows-sandbox-rs/src/uninstall_windows.rs
