@@ -200,13 +200,7 @@ export function createHostShell(options: HostShellOptions): ComputeShell {
                 process.platform === "darwin" || process.platform === "win32"
                     ? absoluteDeniedWritePaths
                     : existingHostPaths(canonicalCwd, deniedWritePaths),
-            ...(process.platform !== "win32" || permissions.mode === "read_only"
-                ? {}
-                : {
-                      deniedWriteFilePaths: projectProtectedFileNames(options.hostPolicy)
-                          .filter((name) => !protectedDirectoryNames.includes(name))
-                          .map((name) => join(canonicalCwd, name)),
-                  }),
+
             ...(permissions.allowedReadPaths === undefined
                 ? {}
                 : { allowedReadPaths: permissions.allowedReadPaths }),
