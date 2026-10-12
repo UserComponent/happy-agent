@@ -416,23 +416,61 @@ describe("gitReferenceChangeAffectsSnapshot", () => {
         expect(gitReferenceChangeAffectsSnapshot(snapshot, undefined)).toBe(true);
     });
 
-    it("watches the local default branch and any origin ref without a remote base", () => {
+    it("follows the chosen comparison branch on whichever remote it lives", () => {
         const feature = {
             ...stampedSnapshot(),
             facts: { ahead: 0, behind: 0, branch: "feature", detached: false },
         };
-        const localBase = { ...feature, baseRef: "refs/heads/master" };
+        const release = {
+            ...feature,
+            baseRef: "refs/remotes/upstream/release-v8.8",
+            baseSource: "inferred" as const,
+        };
+        expect(gitReferenceChangeAffectsSnapshot(release, "remotes/upstream/release-v8.8")).toBe(
+            true,
+        );
+        expect(gitReferenceChangeAffectsSnapshot(release, "remotes/upstream")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(release, "remotes/origin/main")).toBe(false);
+        expect(gitReferenceChangeAffectsSnapshot(release, "remotes/upstream/HEAD")).toBe(false);
+        expect(gitReferenceChangeAffectsSnapshot(release, "heads/main")).toBe(false);
+        expect(gitReferenceChangeAffectsSnapshot(release, "heads/feature")).toBe(true);
+    });
+
+    it("lets a remote default branch replace a local one", () => {
+        const feature = {
+            ...stampedSnapshot(),
+            facts: { ahead: 0, behind: 0, branch: "feature", detached: false },
+        };
+        const localBase = {
+            ...feature,
+            baseRef: "refs/heads/master",
+            baseSource: "default" as const,
+        };
         expect(gitReferenceChangeAffectsSnapshot(localBase, "heads/master")).toBe(true);
         expect(gitReferenceChangeAffectsSnapshot(localBase, "heads/main")).toBe(false);
         expect(gitReferenceChangeAffectsSnapshot(localBase, "heads/other")).toBe(false);
-        expect(gitReferenceChangeAffectsSnapshot(localBase, "remotes/origin/main")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(localBase, "remotes/origin/master")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(localBase, "remotes/fork/master")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(localBase, "remotes/origin/HEAD")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(localBase, "remotes/origin/other")).toBe(false);
+    });
 
+    it("watches every branch while no comparison branch was found", () => {
+        const feature = {
+            ...stampedSnapshot(),
+            facts: { ahead: 0, behind: 0, branch: "feature", detached: false },
+        };
         const { baseRef: _baseRef, ...headBase } = feature;
-        expect(gitReferenceChangeAffectsSnapshot(headBase, "heads/main")).toBe(true);
-        expect(gitReferenceChangeAffectsSnapshot(headBase, "heads/master")).toBe(true);
-        expect(gitReferenceChangeAffectsSnapshot(headBase, "heads/other")).toBe(false);
-        expect(gitReferenceChangeAffectsSnapshot(headBase, "remotes/origin/trunk")).toBe(true);
-        expect(gitReferenceChangeAffectsSnapshot(headBase, "remotes/upstream/main")).toBe(false);
+        expect(gitReferenceChangeAffectsSnapshot(headBase, "heads/other")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(headBase, "remotes/upstream/main")).toBe(true);
+
+        const missing = {
+            ...feature,
+            baseNotice: "The chosen comparison branch was not found.",
+            baseSource: "default" as const,
+        };
+        expect(gitReferenceChangeAffectsSnapshot(missing, "heads/release-v8.8")).toBe(true);
+        expect(gitReferenceChangeAffectsSnapshot(missing, "tags/v1.0.0")).toBe(false);
     });
 });
 

@@ -7,7 +7,11 @@ import { gitIndexFingerprint, gitWorktreeFingerprint } from "./gitWorktreeFinger
 import { parseGitRawNumstat, type GitDiffChange } from "./parseGitRawNumstat.js";
 import { parseGitStatusV2, type GitStatusEntry, type GitStatusV2 } from "./parseGitStatusV2.js";
 import { readGitTreeEntries, type GitTreeEntry } from "./readGitTreeEntries.js";
-import { resolveGitComparisonBase } from "./resolveGitComparisonBase.js";
+import {
+    resolveGitComparisonBase,
+    type GitComparisonBase,
+    type GitComparisonPreferences,
+} from "./resolveGitComparisonBase.js";
 import { runScanGit, type ScanGitRunner } from "./runScanGit.js";
 import type {
     GitChangeState,
@@ -29,6 +33,8 @@ export interface ScanGitRepositoryOptions {
     gitDirectory?: string;
     now?: () => number;
     path: string;
+    /** What the workspace says about the branch its changes are compared with. */
+    preferences?: GitComparisonPreferences;
     /**
      * The last state scanned from this repository. Untracked line counts and binary file bytes
      * whose files have not changed since are carried forward instead of being read again.
@@ -152,9 +158,27 @@ async function scanOnce(
 
     const facts = factsFromStatus(status);
     const conflicted = status.entries.some((entry) => entry.unmerged);
+    const previousState = options.previous;
     const comparison = await resolveGitComparisonBase({
+        ...(status.branch === undefined ? {} : { branch: status.branch }),
         ...(status.head === undefined ? {} : { head: status.head }),
+        now,
+        ...(options.preferences === undefined ? {} : { preferences: options.preferences }),
+        ...(previousState === undefined
+            ? {}
+            : {
+                  previous: {
+                      ...pickComparison(previousState),
+                      ...(previousState.facts.branch === undefined
+                          ? {}
+                          : { branch: previousState.facts.branch }),
+                      ...(previousState.facts.upstream === undefined
+                          ? {}
+                          : { upstream: previousState.facts.upstream }),
+                  },
+              }),
         run,
+        ...(status.upstream === undefined ? {} : { upstream: status.upstream }),
     });
     if (comparison.base === undefined) {
         return unfingerprinted({
@@ -273,8 +297,8 @@ async function scanOnce(
         else displayed.push(enriched);
     }
     const state: GitChangeState = {
+        ...pickComparison(comparison),
         base: comparison.base,
-        ...(comparison.baseRef === undefined ? {} : { baseRef: comparison.baseRef }),
         changedFiles: changes.length,
         comparison: "ready",
         conflicted,
@@ -561,4 +585,16 @@ async function resolveGitDirectory(
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+/** The comparison-branch fields of a resolved base or a scanned state, without the base itself. */
+function pickComparison(
+    source: Pick<GitComparisonBase, "baseCheckedAt" | "baseNotice" | "baseRef" | "baseSource">,
+): Pick<GitComparisonBase, "baseCheckedAt" | "baseNotice" | "baseRef" | "baseSource"> {
+    return {
+        ...(source.baseCheckedAt === undefined ? {} : { baseCheckedAt: source.baseCheckedAt }),
+        ...(source.baseNotice === undefined ? {} : { baseNotice: source.baseNotice }),
+        ...(source.baseRef === undefined ? {} : { baseRef: source.baseRef }),
+        ...(source.baseSource === undefined ? {} : { baseSource: source.baseSource }),
+    };
 }

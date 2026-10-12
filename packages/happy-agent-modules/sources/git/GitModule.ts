@@ -41,7 +41,11 @@ import { remoteProjectName } from "./remoteProjectName.js";
 import { removeGitWorktree } from "./removeGitWorktree.js";
 import { renameGitBranch } from "./renameGitBranch.js";
 import { resolveGitCommit } from "./resolveGitCommit.js";
-import { resolveGitComparisonBase, type GitComparisonBase } from "./resolveGitComparisonBase.js";
+import {
+    resolveGitComparisonBase,
+    type GitComparisonBase,
+    type GitComparisonPreferences,
+} from "./resolveGitComparisonBase.js";
 import { resolveWorkspaceBase, type WorkspaceBase } from "./resolveWorkspaceBase.js";
 import { directGitCommandRunner, runGitCommandWithEnvironment } from "./runGitCommand.js";
 import {
@@ -145,6 +149,8 @@ export type GitSnapshotObserver = (
 
 interface CachedSnapshot {
     readonly expiresAt: number;
+    /** The comparison preferences the snapshot was scanned with, serialized. */
+    readonly preferences: string;
     readonly root: string;
     readonly snapshot: GitChangeSnapshot;
 }
@@ -707,18 +713,33 @@ export class GitModule implements AgentModule {
         return this.#generation;
     }
 
-    /** One repository's change snapshot, served from a short-lived cache. */
-    async snapshot(root: string, key = root, signal?: AbortSignal): Promise<GitChangeSnapshot> {
+    /**
+     * One repository's change snapshot, served from a short-lived cache. `preferences` carries
+     * what the workspace says about the branch its changes are compared with.
+     */
+    async snapshot(
+        root: string,
+        key = root,
+        signal?: AbortSignal,
+        preferences: GitComparisonPreferences = {},
+    ): Promise<GitChangeSnapshot> {
         const now = Date.now();
         this.#evictExpired(now);
         const cached = this.#cache.get(key);
-        if (cached !== undefined && cached.expiresAt > now && cached.root === root) {
+        const wanted = JSON.stringify(preferences);
+        if (
+            cached !== undefined &&
+            cached.expiresAt > now &&
+            cached.root === root &&
+            cached.preferences === wanted
+        ) {
             this.#cache.delete(key);
             this.#cache.set(key, cached);
             return cached.snapshot;
         }
         const state = await scanGitRepository({
             path: root,
+            preferences,
             runGit: this.#scan,
             ...(signal === undefined ? {} : { signal }),
         });
@@ -738,6 +759,7 @@ export class GitModule implements AgentModule {
         }
         this.#cache.set(key, {
             expiresAt: Date.now() + SNAPSHOT_CACHE_MS,
+            preferences: wanted,
             root,
             snapshot,
         });
