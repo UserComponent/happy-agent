@@ -189,6 +189,43 @@ describe("GitStateTracker scheduling", () => {
         }
     });
 
+    it("proves an idle base by merge base instead of rescanning every half hour", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000);
+        const scan = testScan();
+        const tracker = new GitStateTracker(createRootContext(), scan.run, owner());
+        // Subscriptions renew well inside the watch lifetime while a client is looking.
+        const idle = async (milliseconds: number) => {
+            for (let elapsed = 0; elapsed < milliseconds; elapsed += 60_000) {
+                tracker.watch(entity);
+                await advance(60_000);
+            }
+        };
+        try {
+            await startTracking(tracker);
+            expect(scan.diffReads).toBe(1);
+            const scanMergeBases = scan.mergeBaseReads.length;
+
+            await idle(2 * 60 * 60 * 1000);
+            expect(scan.diffReads).toBe(1);
+            expect(scan.mergeBaseReads.length).toBeGreaterThan(scanMergeBases);
+            expect(scan.mergeBaseReads.at(-1)).toEqual([
+                "merge-base",
+                "--end-of-options",
+                "refs/remotes/origin/main",
+                HEAD,
+            ]);
+
+            // A base branch that moved without any event is still caught within the limit.
+            scan.mergeBase = "b".repeat(40);
+            await idle(31 * 60 * 1000);
+            expect(scan.diffReads).toBe(2);
+            expect(tracker.snapshot(entity)?.base).toBe("b".repeat(40));
+        } finally {
+            tracker.dispose();
+        }
+    });
+
     it("checks promptly and cheaply when the working-tree watch goes live", async () => {
         vi.useFakeTimers();
         vi.setSystemTime(1_000);
@@ -300,6 +337,8 @@ describe("gitReferenceChangeAffectsSnapshot", () => {
 interface TestScan {
     diffReads: number;
     fullStatusReads: number;
+    mergeBase: string;
+    readonly mergeBaseReads: string[][];
     pathStatusDirty: boolean;
     pathStatusReads: number;
     run: ScanGitRunner;
@@ -310,6 +349,8 @@ function testScan(): TestScan {
     const scan: TestScan = {
         diffReads: 0,
         fullStatusReads: 0,
+        mergeBase: HEAD,
+        mergeBaseReads: [],
         pathStatusDirty: false,
         pathStatusReads: 0,
         statusEntries: [],
@@ -339,7 +380,10 @@ function testScan(): TestScan {
                 }
                 return result(`${options.cwd}/.git\n`);
             }
-            if (command === "merge-base") return result(`${HEAD}\n`);
+            if (command === "merge-base") {
+                scan.mergeBaseReads.push([...options.args]);
+                return result(`${scan.mergeBase}\n`);
+            }
             if (command === "diff") {
                 scan.diffReads += 1;
                 return result("");
