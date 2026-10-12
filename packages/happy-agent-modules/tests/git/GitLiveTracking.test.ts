@@ -108,6 +108,40 @@ describe("GitModule live tracking", () => {
         expect(published).toBe(1);
     });
 
+    it("measures a watched workspace again against a newly chosen comparison branch", async () => {
+        const repository = await createRepository();
+        await commitFile(repository, "tracked.txt", "one\n");
+        await git(repository, ["branch", "release"]);
+        const head = await commitFile(repository, "tracked.txt", "two\n");
+        await setOriginMain(repository, head);
+        const module = open();
+        const published: GitChangeSnapshot[] = [];
+        module.onSnapshot((_ctx, _entity, snapshot) => {
+            published.push(snapshot);
+        });
+        const entity = { path: repository, projectId: "project-1", workspaceId: "workspace-1" };
+
+        // Nobody watches it yet, so a new choice alone starts nothing.
+        module.retrack({ ...entity, comparisonBase: "release" });
+        expect(module.trackedKeys()).toEqual([]);
+
+        module.track(entity);
+        await waitFor(() => published.length === 1);
+        expect(published[0]).toMatchObject({
+            baseRef: "refs/remotes/origin/main",
+            changedFiles: 0,
+        });
+
+        module.retrack({ ...entity, comparisonBase: "release" });
+        await waitFor(() => published.length === 2);
+        expect(published[1]).toMatchObject({
+            baseRef: "refs/heads/release",
+            baseSource: "explicit",
+            changedFiles: 1,
+        });
+        expect(module.trackedKeys()).toEqual(["workspace:workspace-1"]);
+    });
+
     it("atomically replaces the tracked subscription set while retaining known snapshots", async () => {
         const firstRepository = await createRepository();
         const firstHead = await commitFile(firstRepository, "tracked.txt", "one\n");

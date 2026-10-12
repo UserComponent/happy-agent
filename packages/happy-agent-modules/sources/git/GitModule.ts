@@ -43,6 +43,7 @@ import { renameGitBranch } from "./renameGitBranch.js";
 import { resolveGitCommit } from "./resolveGitCommit.js";
 import {
     resolveGitComparisonBase,
+    shortRef,
     type GitComparisonBase,
     type GitComparisonPreferences,
 } from "./resolveGitComparisonBase.js";
@@ -688,6 +689,11 @@ export class GitModule implements AgentModule {
             },
             comparison: snapshot.comparison,
             base: snapshot.base ?? null,
+            // Written the way a person writes a branch, and null when the base is HEAD or the
+            // empty tree, so a client can say what the numbers are measured against.
+            baseRef: snapshot.baseRef === undefined ? null : shortRef(snapshot.baseRef),
+            baseSource: snapshot.baseRef === undefined ? null : (snapshot.baseSource ?? null),
+            baseNotice: snapshot.baseNotice ?? null,
             changedFiles: snapshot.changedFiles,
             insertions: snapshot.insertions,
             deletions: snapshot.deletions,
@@ -834,6 +840,18 @@ export class GitModule implements AgentModule {
             return;
         }
         this.#trackerInstance().replace(entities);
+    }
+
+    /**
+     * Measures an already watched repository with what its workspace now says, such as a newly
+     * chosen comparison branch. The changed entity replaces the old one and is scanned again; a
+     * repository nobody watches stays unwatched.
+     */
+    retrack(entity: GitTrackedEntity): void {
+        if (this.#disposed || this.#tracker?.trackedKeys.includes(entityKey(entity)) !== true) {
+            return;
+        }
+        this.#tracker.watch(entity);
     }
 
     /** Stops watching one repository and releases its watchers and timers. */
