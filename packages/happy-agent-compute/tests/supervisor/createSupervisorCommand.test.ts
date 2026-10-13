@@ -55,6 +55,28 @@ describe("Windows supervisor setup selection", () => {
             }).args,
         ).toContain("--no-provision");
     });
+    it("marks a background launch from its own environment so it never opens the prompt", () => {
+        vi.stubEnv("HAPPY_WINDOWS_SANDBOX_BACKGROUND", "1");
+        expect(createSupervisorCommand({ ...options, environment: {} }).args).not.toContain(
+            "--background",
+        );
+        const background = createSupervisorCommand({
+            ...options,
+            environment: { HAPPY_WINDOWS_SANDBOX_BACKGROUND: "1" },
+        });
+        expect(background.args).toContain("--background");
+        expect(background.args.indexOf("--background")).toBeLessThan(background.args.indexOf("--"));
+        // Different arguments mean a scan never shares a shell runner with an agent command.
+        expect(background.args).not.toEqual(
+            createSupervisorCommand({ ...options, environment: {} }).args,
+        );
+        expect(
+            createSupervisorCommand({
+                ...options,
+                environment: { HAPPY_WINDOWS_SANDBOX_BACKGROUND: "0" },
+            }).args,
+        ).not.toContain("--background");
+    });
     it("honors the supplied no-provision boundary independently of ambient variables", () => {
         vi.stubEnv("HAPPY_WINDOWS_SANDBOX_NO_PROVISION", "0");
         expect(

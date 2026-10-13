@@ -100,6 +100,10 @@ function windowsStateArgs(environment: NodeJS.ProcessEnv = process.env): string[
         process.env.HAPPY_WINDOWS_SANDBOX_NO_PROVISION === "1"
             ? ["--no-provision"]
             : []),
+        // A background launch, such as a Git scan, must never open the administrator prompt.
+        // Only the command's own environment says so, never the daemon's. It is also part of the
+        // arguments, so a shared shell runner is never reused between a scan and an agent command.
+        ...(environment.HAPPY_WINDOWS_SANDBOX_BACKGROUND === "1" ? ["--background"] : []),
         ...(sandboxState === undefined ? [] : ["--state-dir", sandboxState]),
     ];
 }
