@@ -74,6 +74,14 @@ cannot be deleted on Windows and an idle worker would otherwise block archiving 
 Git itself is still sandboxed: never move scans out of the sandbox to make them cheaper, because
 repository configuration can run programs.
 
+## The scan worker cap never stops a busy worker
+
+The Windows scan worker cap was a hardcoded 32 that evicted the least recently used worker even
+in the middle of a scan. That scan failed, and the next one paid a sandbox logon to restart the
+worker. The cap is now configurable (`HAPPY_GIT_SCAN_WORKER_MAX`, 1 to 256, default 32), and
+eviction skips workers that are busy, held by an agent run, or followed by the tracker. The count
+may briefly exceed the cap and is trimmed as workers become idle.
+
 ## A working-tree watch must never be replaced or outlive its folder
 
 Two watcher failures surfaced only in the release gate. On Linux, replacing a folder's Parcel
