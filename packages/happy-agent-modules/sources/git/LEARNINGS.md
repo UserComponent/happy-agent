@@ -112,6 +112,15 @@ worker. The cap is now configurable (`HAPPY_GIT_SCAN_WORKER_MAX`, 1 to 256, defa
 eviction skips workers that are busy, held by an agent run, or followed by the tracker. The count
 may briefly exceed the cap and is trimmed as workers become idle.
 
+## "Git changes are unavailable" everywhere can be the sandbox, not Git
+
+On Windows, every workspace at once showing Git changes as unavailable was a sandbox ACL problem:
+the sandbox group had been denied the whole user profile, so the read-only scanner could not read
+any repository inside it. Check `icacls $env:USERPROFILE` for a `HappySandboxUsers` deny before
+debugging Git. Setup now removes such a deny on its own; why it existed and how workspaces outside
+the profile avoid it are in
+`packages/happy-agent-supervisor/native/windows/EXTERNAL_SANDBOX_IDENTITY.md`.
+
 ## A working-tree watch must never be replaced or outlive its folder
 
 Two watcher failures surfaced only in the release gate. On Linux, replacing a folder's Parcel
