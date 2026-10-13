@@ -32,6 +32,9 @@ import { testConfigRootedAt } from "../support/configModule.js";
 import { moduleDatabase } from "../support/moduleDatabase.js";
 import { workspacesCatalogFrom } from "../support/workspacesModule.js";
 
+// Durable work starts asynchronously and can take seconds on a busy Windows machine.
+const SLOW_WAIT = { timeout: 10_000 };
+
 afterEach(cleanupRoots);
 
 describe("nested workspace provisioning", () => {
@@ -270,7 +273,7 @@ setup_commands = [
 
             await vi.waitFor(() => {
                 expect(existsSync(join(workspace.path, "second-started"))).toBe(true);
-            });
+            }, SLOW_WAIT);
             world.durableFunctions.stop();
             await writeFile(join(workspace.path, "finish-setup"), "yes", "utf8");
 
@@ -326,7 +329,7 @@ setup_commands = [
             if (workspace === undefined) throw new Error("The workspace was not created.");
             await vi.waitFor(() => {
                 expect(existsSync(join(workspace.path, "setup-started"))).toBe(true);
-            });
+            }, SLOW_WAIT);
 
             expect(
                 (await world.workspaces.archive(world.database.context, workspace.id)).status,
@@ -578,7 +581,7 @@ setup_commands = [
                     status: "failed",
                     initializationError: expect.stringMatching(/parent.*ready|parent.*available/iu),
                 });
-            });
+            }, SLOW_WAIT);
         } finally {
             await world.close();
         }
