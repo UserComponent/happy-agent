@@ -1154,6 +1154,7 @@ const pathSchemaSet = Type.Object(
         databasePath: pathSchema,
         docsHome: pathSchema,
         generatedPath: pathSchema,
+        gitSnapshotsPath: pathSchema,
         globalConfigPath: pathSchema,
         happyHome: pathSchema,
         historyDumpHome: pathSchema,
@@ -3270,6 +3271,9 @@ function derivePaths(input: HappyAgentConfigurationInput): HappyAgentConfigurati
         databasePath: join(agentHome, "agent.sqlite"),
         docsHome: join(happyHome, "docs"),
         generatedPath: join(publicHome, "Generated"),
+        // The last Git state of each watched repository, so a restart shows it at once and only
+        // has to prove it still current.
+        gitSnapshotsPath: join(agentHome, "git-snapshots.json"),
         globalConfigPath: join(configHome, "happy.toml"),
         happyHome,
         historyDumpHome: join(observationHome, "history"),
