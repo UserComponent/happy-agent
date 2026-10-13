@@ -133,3 +133,14 @@ verify ordinary events, ignored directories, unsubscribe, and callback garbage c
 Parcel reports canonical event paths. Each subscription resolves its native root and uses that
 same root for ignore paths and relative event names, so a caller's symlink alias cannot hide
 changes. Missing roots keep the original path and the ordinary subscription retry behavior.
+
+## Scan workers deny what agent shells deny
+
+On Windows the deny-read ACL state is kept per sandbox group, and each sandbox setup reconciles the
+group to the set it was given, revoking anything else. Agent shells are given the daemon's own
+state directory (token, databases) through the compute module's host policy; scan workers were
+created without it, so each worker setup revoked that deny (dozens of times a day in the sandbox
+log), and while it was revoked a sandboxed command could read the daemon's credentials. Scan
+workers now take the same host policy from the compute module. A worker that denies less than the
+shell undoes the shell's protection, so never create a sandboxed Git command with a narrower
+policy.

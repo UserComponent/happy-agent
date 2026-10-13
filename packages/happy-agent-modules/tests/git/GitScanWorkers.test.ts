@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 interface FakeWorker {
     cwd: string;
+    options: { hostPolicy?: unknown };
     disposed: boolean;
     keepAlive: () => boolean;
     pending: Array<() => void>;
@@ -15,9 +16,14 @@ const created: FakeWorker[] = [];
 
 vi.mock("@slopus/happy-agent-compute", () => ({
     computePermissions: (mode: string) => ({ mode, network: { egress: false } }),
-    createHostCommandWorker: (options: { cwd: string; keepAlive: () => boolean }) => {
+    createHostCommandWorker: (options: {
+        cwd: string;
+        hostPolicy?: unknown;
+        keepAlive: () => boolean;
+    }) => {
         const worker: FakeWorker = {
             cwd: options.cwd,
+            options,
             disposed: false,
             hold: false,
             keepAlive: options.keepAlive,
@@ -57,6 +63,7 @@ describe("GitScanWorkers", () => {
             () => root,
             () => tracked,
             () => 32,
+            () => undefined,
         );
         const folder = process.platform === "win32" ? "C:\\Work\\Repo" : "/work/repo";
 
@@ -90,6 +97,7 @@ describe("GitScanWorkers", () => {
             () => root,
             () => [],
             () => 32,
+            () => undefined,
         );
         const folder = process.platform === "win32" ? "C:\\Work\\Shared" : "/work/shared";
         const first = workers.hold(folder, undefined);
@@ -101,6 +109,29 @@ describe("GitScanWorkers", () => {
         workers.dispose();
     });
 
+    it("creates each worker with the host policy its constructor supplies", () => {
+        created.length = 0;
+        const hostPolicy = {
+            privateDirectories: ["/home/user/.happy/agent"],
+            protectedProjectFiles: ["AGENTS.md"],
+        };
+        let policy: typeof hostPolicy | undefined = hostPolicy;
+        const workers = new GitScanWorkers(
+            () => createRootContext(),
+            () => [],
+            () => 32,
+            () => policy,
+        );
+        workers.hold(process.platform === "win32" ? "C:\\Work\\One" : "/work/one", undefined);
+        expect(created[0]!.options.hostPolicy).toEqual(hostPolicy);
+        expect(created[0]!.options.hostPolicy).toBe(hostPolicy);
+
+        // Without a policy the key is omitted rather than passed as undefined.
+        policy = undefined;
+        workers.hold(process.platform === "win32" ? "C:\\Work\\Two" : "/work/two", undefined);
+        expect("hostPolicy" in created[1]!.options).toBe(false);
+        workers.dispose();
+    });
     describe("with a limit of two workers", () => {
         const folder = (name: string) =>
             process.platform === "win32" ? `C:\\Work\\${name}` : `/work/${name}`;
@@ -110,6 +141,7 @@ describe("GitScanWorkers", () => {
                 () => createRootContext(),
                 tracked,
                 () => 2,
+                () => undefined,
             );
             return { scan: workers.scanner(() => undefined), workers };
         };

@@ -185,6 +185,7 @@ export class GitModule implements AgentModule {
         () => this.#root(),
         () => this.#tracker?.paths() ?? [],
         () => this.#config?.gitScanWorkerLimit ?? 32,
+        () => this.#compute?.hostPolicy,
     );
     /** Each running agent's hold on its folder's scan worker, released when the run settles. */
     readonly #runHolds = new Map<string, () => void>();
