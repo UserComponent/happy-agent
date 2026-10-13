@@ -124,7 +124,13 @@ import type {
     WriteFileRequest,
     WriteFileResponse,
 } from "./protocol/files.js";
-import type { GitStateResponse, WatchGitRequest, WatchGitResponse } from "./protocol/git.js";
+import type {
+    GitStateResponse,
+    ListWorkspaceBranchesQuery,
+    ListWorkspaceBranchesResponse,
+    WatchGitRequest,
+    WatchGitResponse,
+} from "./protocol/git.js";
 import type { HappyIntegrationResponse } from "./protocol/integrations.js";
 import type {
     CloseLiveSessionRequest,
@@ -204,6 +210,7 @@ import type {
     ListWorkspacesQuery,
     RenameWorkspaceRequest,
     ReorderWorkspaceRequest,
+    UpdateWorkspaceRequest,
     WorkspaceListResponse,
     WorkspaceResponse,
 } from "./protocol/workspaces.js";
@@ -1137,6 +1144,24 @@ export class HappyAgentClient {
         });
     }
 
+    /**
+     * `PATCH /v0/workspaces/:workspaceId` with a name, a comparison branch, or both. Daemons that
+     * do not report `comparisonBase` on the workspace reject a request that carries it.
+     */
+    async updateWorkspace(
+        workspaceId: Cuid2,
+        request: UpdateWorkspaceRequest,
+        options: VersionedRequestOptions,
+    ): Promise<WorkspaceResponse> {
+        return await this.#json({
+            method: "PATCH",
+            path: `v0/workspaces/${encodeURIComponent(workspaceId)}`,
+            json: request,
+            ifMatch: options.ifMatch,
+            signal: options.signal,
+        });
+    }
+
     /** `POST /v0/workspaces/:workspaceId/archive` — archives it and everything beneath. */
     async archiveWorkspace(
         workspaceId: Cuid2,
@@ -1894,6 +1919,23 @@ export class HappyAgentClient {
         return await this.#json({
             method: "GET",
             path: `v0/workspaces/${encodeURIComponent(workspaceId)}/git`,
+            signal: options.signal,
+        });
+    }
+
+    /**
+     * `GET /v0/workspaces/:workspaceId/git/branches` — the branches the workspace's changes can be
+     * compared with. Daemons older than the route answer `404`.
+     */
+    async listWorkspaceBranches(
+        workspaceId: Cuid2,
+        query: ListWorkspaceBranchesQuery = {},
+        options: RequestOptions = {},
+    ): Promise<ListWorkspaceBranchesResponse> {
+        return await this.#json({
+            method: "GET",
+            path: `v0/workspaces/${encodeURIComponent(workspaceId)}/git/branches`,
+            query: { query: query.query, limit: query.limit },
             signal: options.signal,
         });
     }
