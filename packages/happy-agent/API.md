@@ -3948,6 +3948,27 @@ The git state object:
 The current git state, scanning if nothing fresh is cached. Response — `200`:
 `{ "git": { ... } }`; `404` for a workspace without a repository.
 
+#### `GET /v0/workspaces/:workspaceId/git/branches`
+
+The branches a workspace's changes can be compared with, for choosing `comparisonBase`.
+Query: `query`, an optional case-insensitive substring of at most 200 characters, and `limit`,
+1 to 200, default 50. Response, `200`:
+`{ "branches": [ { "ref": "origin/release-v8.8", "remote": true, "committedAt": 1755400000000 } ], "truncated": false }`
+
+- `ref`: written like the git state's `baseRef`, and accepted unchanged as `comparisonBase`.
+  Local branches and every remote's tracking branches are listed. Symbolic refs such as
+  `origin/HEAD`, the checked-out branch, and names longer than 200 characters are not.
+- `remote`: whether `ref` is a remote-tracking branch. `committedAt` is the tip commit's time,
+  or `null` when it cannot be read.
+- Branches whose name, with or without its remote, starts with `query` come first. The rest
+  are ordered newest commit first, and an empty `query` lists the newest branches.
+  `truncated` is `true` when more branches matched than were returned.
+- The list reads refs already on the machine. It never fetches, and it may lag the remote by a
+  few seconds.
+
+`400` for an invalid `query`, `limit`, or unknown parameter. `404` for a workspace on a runner
+or without a repository. Daemons older than this route answer `404`.
+
 #### `POST /v0/git/watch`
 
 Subscribes workspaces to the daemon's one live git watcher. Watching is a subscription, not a
