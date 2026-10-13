@@ -1,4 +1,4 @@
-﻿const COMPONENT_LIMIT = 65535;
+const COMPONENT_LIMIT = 65535;
 const SEMANTIC_VERSION = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
 
 /** Turns a semantic version into the four-part numeric version Windows executables carry. */
