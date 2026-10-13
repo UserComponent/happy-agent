@@ -126,12 +126,22 @@ describe("workspace service HTTP API", () => {
             });
             await vi.waitFor(
                 async () =>
+                    expect((await f.services.get(f.ctx, workspaceId, service.id)).status).toBe(
+                        "running",
+                    ),
+                SLOW_WAIT,
+            );
+            await vi.waitFor(
+                async () =>
                     expect((await f.services.get(f.ctx, workspaceId, other.id)).status).toBe(
                         "running",
                     ),
                 SLOW_WAIT,
             );
-            vi.spyOn(f.running[0]!.service, "connect").mockImplementation(async () => {
+            const serviceRuntime = f.running.find(
+                (entry) => entry.service.execution.id === service.id,
+            )!;
+            vi.spyOn(serviceRuntime.service, "connect").mockImplementation(async () => {
                 const endpoint = connect((app.address() as { port: number }).port, "127.0.0.1");
                 await once(endpoint, "connect");
                 return endpoint;
