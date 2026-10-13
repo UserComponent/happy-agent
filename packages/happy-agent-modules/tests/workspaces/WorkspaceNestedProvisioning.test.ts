@@ -209,7 +209,7 @@ describe("nested workspace provisioning", () => {
         const world = await createWorld(
             "workspace-setup-failure",
             `[workspace]
-setup_commands = ['node -e "require(\\"node:fs\\").writeFileSync(\\"setup-ran.txt\\", \\"ran\\"); process.exit(23)"']`,
+setup_commands = ['''node -e "require('node:fs').writeFileSync('setup-ran.txt','ran'); process.exit(23)"''']`,
         );
         try {
             const workspaceId = createId();
@@ -248,8 +248,8 @@ setup_commands = ['node -e "require(\\"node:fs\\").writeFileSync(\\"setup-ran.tx
             "workspace-checkpoint-restart",
             `[workspace]
 setup_commands = [
-  'echo run >> first-runs.txt',
-  'touch second-started; while [ ! -f finish-setup ]; do sleep 1; done'
+  '''node -e "require('node:fs').appendFileSync('first-runs.txt','run\\n')"''',
+  '''node -e "const fs=require('node:fs'); fs.writeFileSync('second-started',''); const t=setInterval(()=>{ fs.existsSync('finish-setup') && clearInterval(t) },200)"'''
 ]`,
         );
         let restarted: ReturnType<typeof workspacesCatalogFrom> | undefined;
@@ -307,7 +307,7 @@ setup_commands = [
             "workspace-archive-during-provision",
             `[workspace]
 setup_commands = [
-  'touch setup-started; while true; do sleep 1; done'
+  '''node -e "require('node:fs').writeFileSync('setup-started',''); setInterval(()=>{},1000)"'''
 ]`,
         );
         try {
