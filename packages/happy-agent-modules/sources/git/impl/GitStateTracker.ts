@@ -1,5 +1,6 @@
 import type { Context, RootContext } from "@steve.kite/stdlib";
 
+import type { GitComparisonPreferences } from "../resolveGitComparisonBase.js";
 import type { ScanGitRunner } from "../runScanGit.js";
 import {
     readGitWorktreeFingerprint,
@@ -665,6 +666,7 @@ export class GitStateTracker {
                     ? {}
                     : { gitDirectory: tracker.gitDirectory }),
                 path: tracker.entity.path,
+                preferences: comparisonPreferences(tracker.entity),
                 ...(tracker.snapshot === undefined ? {} : { previous: tracker.snapshot }),
                 runGit: this.#scan,
                 signal: controller.signal,
@@ -778,6 +780,7 @@ export class GitStateTracker {
     async #runScan(entity: GitTrackedEntity, signal?: AbortSignal): Promise<GitChangeState> {
         return await scanGitRepository({
             path: entity.path,
+            preferences: comparisonPreferences(entity),
             runGit: this.#scan,
             ...(signal === undefined ? {} : { signal }),
         });
@@ -810,47 +813,59 @@ function sameEntity(left: GitTrackedEntity, right: GitTrackedEntity): boolean {
     return (
         left.path === right.path &&
         left.projectId === right.projectId &&
-        left.workspaceId === right.workspaceId
+        left.workspaceId === right.workspaceId &&
+        left.comparisonBase === right.comparisonBase &&
+        left.recordedBaseRef === right.recordedBaseRef &&
+        left.recordedBaseCommit === right.recordedBaseCommit
     );
 }
 
+/** What a tracked workspace says about its comparison branch, in the scan's terms. */
+function comparisonPreferences(entity: GitTrackedEntity): GitComparisonPreferences {
+    return {
+        ...(entity.comparisonBase === undefined ? {} : { comparisonBase: entity.comparisonBase }),
+        ...(entity.recordedBaseRef === undefined
+            ? {}
+            : { recordedBaseRef: entity.recordedBaseRef }),
+        ...(entity.recordedBaseCommit === undefined
+            ? {}
+            : { recordedBaseCommit: entity.recordedBaseCommit }),
+    };
+}
+
+/**
+ * Whether a branch or remote ref moving can change what a snapshot shows.
+ *
+ * The narrow case follows the chosen comparison branch: the snapshot's own branch, its upstream,
+ * and its comparison ref. A comparison on the default branch also follows every remote's HEAD and,
+ * when the base is a local branch, that branch on any remote, since either can take its place.
+ * Without a comparison ref, or when the preferred one was missing, any branch may become it.
+ */
 export function gitReferenceChangeAffectsSnapshot(
     snapshot: GitChangeSnapshot | undefined,
     entry: string | undefined,
 ): boolean {
     if (entry === undefined || snapshot === undefined) return true;
     const normalized = entry.replaceAll("\\", "/").replace(/\.lock$/, "");
-    // A remote base is the narrow, shared case. Without one, any origin branch or the local
-    // default branch appearing or moving can change which base the next scan picks.
-    const base = snapshot.baseRef?.replace(/^refs\//, "");
-    const remoteBase = base?.startsWith("remotes/") === true ? base : undefined;
-    if (normalized.startsWith("heads/")) {
-        const branch = snapshot.facts.branch;
-        return (
-            branch === undefined ||
-            referenceEventMatches(`heads/${branch}`, normalized) ||
-            (remoteBase === undefined &&
-                (base === undefined
-                    ? referenceEventMatches("heads/main", normalized) ||
-                      referenceEventMatches("heads/master", normalized)
-                    : referenceEventMatches(base, normalized)))
-        );
-    }
-    if (normalized.startsWith("remotes/")) {
-        const upstream =
-            snapshot.facts.upstream === undefined
-                ? undefined
-                : `remotes/${snapshot.facts.upstream}`;
-        return (
-            (remoteBase === undefined
-                ? referenceEventMatches("remotes/origin", normalized) ||
-                  normalized.startsWith("remotes/origin/")
-                : referenceEventMatches(remoteBase, normalized)) ||
-            (upstream !== undefined && referenceEventMatches(upstream, normalized))
-        );
-    }
     if (normalized === "tags" || normalized.startsWith("tags/")) return false;
-    return true;
+    if (!normalized.startsWith("heads/") && !normalized.startsWith("remotes/")) return true;
+    const branch = snapshot.facts.branch;
+    if (branch === undefined || referenceEventMatches(`heads/${branch}`, normalized)) return true;
+    const upstream = snapshot.facts.upstream;
+    if (upstream !== undefined && referenceEventMatches(`remotes/${upstream}`, normalized)) {
+        return true;
+    }
+    const base = snapshot.baseRef?.replace(/^refs\//, "");
+    if (base === undefined || snapshot.baseNotice !== undefined) return true;
+    if (referenceEventMatches(base, normalized)) return true;
+    if (snapshot.baseSource !== "default" || !normalized.startsWith("remotes/")) return false;
+    // `remotes/<remote>/HEAD` names the default branch; a local default yields to a remote one.
+    const remoteBranch = normalized.slice(normalized.indexOf("/", "remotes/".length) + 1);
+    return (
+        normalized.split("/").length <= 2 ||
+        remoteBranch === "HEAD" ||
+        (base.startsWith("heads/") && remoteBranch === base.slice("heads/".length))
+    );
 }
 
 function referenceEventMatches(expected: string, observed: string): boolean {
