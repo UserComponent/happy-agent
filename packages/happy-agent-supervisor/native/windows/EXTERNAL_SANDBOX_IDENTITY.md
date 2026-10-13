@@ -2,9 +2,9 @@
 
 Setup version 10 gives sandboxed commands for workspaces outside the Windows user profile their
 own Windows accounts and group. This document explains the flaw it fixes, why it needs one
-elevated setup, every alternative that was considered, and how to verify, roll back and review
-it. Everything below describes the native Windows sandbox in this directory: the pinned Codex
-sources, `happy.patch`, and the supervisor in `main.rs`.
+elevated setup, when that setup is asked for, every alternative that was considered, and how to
+verify, roll back and review it. Everything below describes the native Windows sandbox in this
+directory: the pinned Codex sources, `happy.patch`, and the supervisor in `main.rs`.
 
 ## Summary
 
@@ -20,8 +20,13 @@ sources, `happy.patch`, and the supervisor in `main.rs`.
   profile is denied to the external group once and permanently. Nothing toggles the profile ACL
   any more.
 - Creating local accounts and groups and changing firewall and WFP rules requires an
-  administrator, so existing installations see one UAC prompt to upgrade. Everything else in this
-  branch works with the existing setup version 9 and no prompt.
+  administrator, so it needs one UAC prompt. That prompt is deferred: it is asked for only the
+  first time a workspace **outside** the profile needs a sandbox, or by
+  `happy-agent sandbox setup`. A user who only works inside the profile keeps running on the
+  existing accounts exactly as on setup version 9 and never sees it. If the prompt is declined or
+  unavailable, outside workspaces fail with a clear message. Nothing falls back to a weaker
+  sandbox. Background Git scans never open the prompt. Everything else in this branch works with
+  the existing setup version 9 and no prompt.
 
 ## The problem in detail
 
@@ -174,7 +179,7 @@ applies to them too, and the external group adds only the profile.
 | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Never deny the profile root; deny only the known credential paths everywhere | No prompt and no toggling, but it loosens the sandbox. An outside workspace could read every inside repository the sandbox group was granted, plus anything in the profile an application opened to `Users` or `Everyone`: browser profiles, editor state, tokens in tools Happy does not know about. The list of credential paths is a best effort, not a boundary. |
 | Fully restricted tokens, so a capability SID can deny reads                  | Every read would also have to pass the restricting SIDs, which `Everyone`-readable system folders, `Program Files`, the registry and many named objects do not grant to them. Most tools would break, and it rewrites the pinned Codex token model, the hardest code in the sandbox to review.                                                                       |
-| Toggle the deny, but correctly (the revocation fix alone)                    | That is what the lower commits do now, as a fallback. It is correct but still rewrites the whole profile on every switch between kinds of workspace, and leaves a running command exposed when another workspace's setup revokes its deny.                                                                                                                           |
+| Toggle the deny, but correctly (the revocation fix alone)                    | That is what the lower commits do. It is correct but still rewrites the whole profile on every switch between kinds of workspace, and leaves a running command exposed when another workspace's setup revokes its deny.                                                                                                                                              |
 | Keep the one-shot path for outside workspaces                                | Narrows the window to one command, but brings back a logon and a desktop per command for those workspaces (the storm this branch fixes), and does not stop the profile walks.                                                                                                                                                                                        |
 | Skip sandboxed Git for outside workspaces, with a notice                     | Stops the Git scan part of the churn only. Shell commands there still toggle the deny, and the Git panel goes dark for those workspaces.                                                                                                                                                                                                                             |
 | Ask users to move workspaces under the profile                               | Works without code, but is not a product answer: monorepos on a second drive, `C:\src` layouts and Dev Drives are common and deliberate.                                                                                                                                                                                                                             |
@@ -204,25 +209,74 @@ workspace, and is never removed afterwards.
 
 ### When the prompt appears, and what happens if it is declined
 
-- **Existing installations** (setup version 9 written by this installation, canonical state
-  directory): the first sandboxed command after the upgrade, including a background Git scan,
-  finds the installation outdated. Automatic setup is allowed to upgrade an installation's own
-  accounts, so it opens the UAC prompt once.
-- **New installations:** unchanged, one prompt at first use, which now creates all four accounts.
-- **Explicit state directories** (`HAPPY_WINDOWS_SANDBOX_HOME`) never prompt automatically. Run
-  `happy-agent sandbox setup`.
-- **Declined or failed:** the attempt is recorded in `.sandbox\setup-attempt.json`, and no later
-  command reopens the prompt. Until setup succeeds, sandboxed commands fail with "A previous Happy
-  Windows sandbox setup attempt did not complete … Run `happy-agent sandbox setup --retry`". That
-  includes Git scans, so the Git panel shows changes as unavailable. If the prompt is still open
-  or its outcome is unknown, finish it or restart Windows before retrying; a retry never overlaps
-  a pending helper.
-- `HAPPY_WINDOWS_SANDBOX_NO_PROVISION=1` blocks every provisioning path, as before.
+Setup version 10 is what this build writes, but readiness is decided per scope. A record at
+version 9 or 10 serves workspaces inside the profile with the shared account pair, as it always
+has. Workspaces outside the profile need version 10 with the external accounts. So the prompt is
+opened only by the first command that needs accounts that do not exist yet:
+
+| Case                                                                                   | First sandboxed command inside the profile                         | First sandboxed command outside the profile                                                                     |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| New installation (no record)                                                           | One prompt. It provisions all four accounts and writes version 10. | The same single prompt, whichever command comes first.                                                          |
+| Existing version 9 installation, inside workspaces only                                | No prompt. Runs as the shared pair, as on version 9.               | Not applicable.                                                                                                 |
+| Existing version 9 installation, first outside workspace                               | No prompt.                                                         | One prompt. It adds the external pair and the record becomes version 10. The shared pair keeps its passwords.   |
+| Outside approval declined or failed                                                    | Keeps working.                                                     | Fails with "needs a one-time administrator approval" and the retry command. No further prompt until `--retry`.  |
+| Prompt unavailable (no interactive desktop, such as a daemon over SSH or in session 0) | Keeps working.                                                     | The attempt fails and is latched as declined, with the same message. Run `--retry` from an interactive session. |
+| Daemon already elevated                                                                | No prompt.                                                         | The helper runs without a prompt.                                                                               |
+| Already approved (version 10 with four accounts)                                       | No prompt.                                                         | No prompt.                                                                                                      |
+| `HAPPY_WINDOWS_SANDBOX_HOME` set                                                       | Never automatic.                                                   | Never automatic. The message says to run `happy-agent sandbox setup`.                                           |
+| `HAPPY_WINDOWS_SANDBOX_NO_PROVISION=1`                                                 | Never provisions.                                                  | Never provisions. The message says provisioning is disabled.                                                    |
+| Record older than version 9                                                            | One prompt, a full upgrade to version 10.                          | The same prompt.                                                                                                |
+| Record newer than version 10                                                           | Fails. A build never downgrades a newer record.                    | The same.                                                                                                       |
+
+A first-time setup provisions all four accounts, because the user is already approving one prompt.
+That way nobody sees a second prompt later.
+
+Declining is never a reason to run an outside workspace in a weaker sandbox. Outside workspaces
+fail with a message that names the folder kind, the one-time approval and the exact command, for
+example "Workspaces outside your user folder need a one-time administrator approval. A previous
+request did not complete. Run `happy-agent sandbox setup --retry` to ask again." The failure is
+shown where the command ran: a shell command returns it as the tool error, the Git panel shows
+changes as unavailable with the message, and `happy-agent sandbox status` reports it.
+
+#### Attempts are latched per scope
+
+- An automatic attempt for the profile scope records its outcome in `.sandbox\setup-attempt.json`.
+  An automatic attempt for outside workspaces records it in `.sandbox\setup-attempt-external.json`.
+  A declined outside prompt therefore never blocks the repair of a workspace inside the profile.
+- An automatic attempt is refused when its own file exists. A completed failure of the other
+  scope's file does not block it.
+- Explicit setup is refused when either file exists, and says to use `--retry`. `--retry` asks
+  again unless an earlier helper may still be running.
+- Two elevated helpers never overlap. If any file records an attempt of the current boot that did
+  not complete, every other attempt is refused until it finishes or Windows restarts.
+- A successful attempt provisions every account, so it removes both files.
+
+#### Background scans never open the prompt
+
+Git scans run for every watched workspace each time the daemon starts. If they could open the
+prompt, a restart would show one with nothing on screen to explain it. Scans therefore mark their
+launch as a background launch, and so does every `--worker` supervisor. A background launch never
+opens the prompt, for first-time setup or for repair, in either scope. It fails with "Happy needs a
+one-time administrator approval before it can read Git changes here. Run
+`happy-agent sandbox setup`, or start an agent in this workspace." For an outside workspace the
+message says "in folders outside your user folder". Only an agent command, which follows a user's
+message in that workspace, or `happy-agent sandbox setup` may open the prompt.
+
+#### Passwords survive the upgrade
+
+The elevated helper used to reset the passwords of every sandbox account each time it ran, and to
+write the users file non-atomically. With deferred setup it runs while workspaces inside the
+profile are active, and a command logging on between the reset and the file write would have
+failed its logon. The helper now reuses the recorded passwords of accounts that already exist,
+generates passwords only for accounts it creates, and always replaces the users file in one step.
+If the existing file cannot be read and decrypted as a whole, it generates new passwords for all
+four, as before.
 
 ## Verify
 
 ```powershell
-happy-agent sandbox status          # "configured", Setup version: 10
+happy-agent sandbox status          # "configured"; and either "Workspaces outside your user
+                                    # folder: ready." or "...: not set up yet."
 Get-LocalUser HappySandbox*         # four accounts, all enabled
 Get-LocalGroupMember HappySandboxUsersExternal   # HappySandboxOfflineX, HappySandboxOnlineX
 icacls $env:USERPROFILE              # HappySandboxUsersExternal:(DENY)(R) once an outside
@@ -251,7 +305,9 @@ leave the `icacls` output unchanged.
     Deleting a group leaves its ACEs behind as unresolvable SIDs. Remove the profile deny first
     with `icacls $env:USERPROFILE /remove:d HappySandboxUsersExternal` while the group still exists.
 
-- **Rolling back to a version-9 build.** A version-9 build sees a newer record, which it never
+- **Rolling back to a version-9 build.** An installation that never approved the outside
+  accounts is still on its version 9 record, and a version-9 build runs on it untouched. An
+  installation that did approve has a version 10 record, which a version-9 build never
   downgrades automatically, so its sandboxed commands fail until `happy-agent sandbox setup` is
   run deliberately (one UAC prompt). That rewrites the record as version 9. The external accounts
   and group stay behind unused, because a version-9 build does not know them; remove them as
@@ -283,42 +339,34 @@ the whole profile on every switch between workspaces or gives outside workspaces
 the profile.
 
 **Does every user get the prompt?**
-Yes, with this commit as written: every existing installation upgrades on its first sandboxed
-command, whether or not it ever uses an outside workspace. See the next answer for how to avoid
-that.
+No. A new installation sees one prompt at first use. An existing installation on setup version 9
+sees it only when a command first needs the accounts for a workspace outside the profile. A user
+who only works inside the profile never sees it, and their commands keep running as the shared
+account pair, unchanged.
 
-**Can it be optional or lazy, prompting only when an outside workspace is first used?**
-Yes, and that is the recommended next step before this ships widely. It is not part of this
-commit, because it touches readiness, the setup gate, the provisioning payload and the
-firewall/WFP account lists, and needs its own tests. The design:
-
-1. Keep setup version 9 as the version of the shared accounts, so an inside-only installation is
-   ready without upgrading.
-2. Track the external pair separately (the users file already stores it as an optional record)
-   and check readiness per scope: inside commands need only the shared pair; outside commands
-   need both.
-3. On the first outside command without the external pair, run the existing automatic setup gate
-   for the external scope only. That is one prompt, latched like today.
-4. New installations provision all four accounts at first use, so they still see one prompt.
-5. Until the external pair exists, or if the prompt is declined, outside workspaces fall back to
-   the shared group: the correct toggle from the lower commits, with a notice that the workspace
-   would be faster and safer after setup. Nothing breaks for a user who declines.
-
-Under this design, users who never open an outside workspace never see a second prompt. Users who
-do see it once, at the moment it explains itself.
+**Can it be lazy, prompting only when an outside workspace is first used?**
+It is. Readiness is checked per scope. Commands for workspaces inside the profile need only the
+shared pair, which a version 9 or version 10 record provides. Commands for workspaces outside it
+need the external pair, so the first one runs the automatic setup gate for that scope, and the
+user sees one prompt at the moment it explains itself. The prompt is latched like any other
+attempt. New installations provision all four accounts at first use, so they still see only one.
+Background Git scans never open it.
 
 **What happens if the user declines?**
-Today: sandboxed commands, including Git scans, fail with a message pointing at
-`happy-agent sandbox setup --retry`, and no further prompt appears on its own. With the lazy
-design, only outside workspaces would be affected, and they would keep working on the fallback.
+Only outside workspaces are affected. Their commands, including Git scans, fail with a message
+that says they need a one-time administrator approval and names
+`happy-agent sandbox setup --retry`, and no further prompt appears on its own. Workspaces inside
+the profile keep working. Nothing falls back to a weaker sandbox: a fallback to the shared group
+would leave a running command exposed whenever another workspace's setup revoked the profile
+deny, which is the flaw this change removes.
 
 **What about managed or enterprise machines, and standard users?**
 Creating local accounts may be blocked by policy, and a standard user cannot approve the prompt
 without administrator credentials. Both were already true for Happy's first-use setup, so this
 adds no new class of requirement, but it does add a second moment where one is needed. An
 administrator can run `happy-agent sandbox setup` once for the user, or deploy it with the rest of
-the installation. The lazy design limits the impact to machines that actually use outside
-workspaces.
+the installation. The prompt is deferred, so the impact is limited to machines that actually use
+outside workspaces; workspaces inside the profile are unaffected.
 
 **Does it give the model more access?**
 No. All four accounts are non-administrator, hidden, and reachable only through Happy's restricted
@@ -351,7 +399,7 @@ reconcile, revocation removes deny entries, the record is written before applyin
 atomically, and every setup checks the profile root's actual ACL.
 
 **Why not just fix revocation and keep one group?**
-The lower commits do exactly that, as the fallback. It is correct, but each switch between an
+The lower commits do exactly that. It is correct, but each switch between an
 inside and an outside workspace still rewrites the entire profile, which is the expensive
 operation this whole branch is about, and a command that is already running can lose its deny.
 The second group removes both.

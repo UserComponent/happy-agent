@@ -151,6 +151,12 @@ Windows profile run as these accounts, whose group is permanently denied the
 profile, so switching between inside and outside workspaces never rewrites the
 profile's ACL (see
 [EXTERNAL_SANDBOX_IDENTITY.md](../../happy-agent-supervisor/native/windows/EXTERNAL_SANDBOX_IDENTITY.md)).
+A new installation creates all four accounts at its one prompt. An existing
+installation that only works inside the Windows profile is never asked again; it
+is prompted once, the first time an agent runs a command in a workspace outside
+the profile. A declined or unavailable prompt makes only those outside
+workspaces fail, with a message naming `happy-agent sandbox setup`; nothing
+falls back to a weaker sandbox. Background Git scans never open the prompt.
 A failed or cancelled attempt is retained; repeated
 commands do not retry UAC. After addressing the reported error,
 `happy-agent sandbox setup --retry` deliberately permits one more attempt.
