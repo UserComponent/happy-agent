@@ -142,3 +142,14 @@ daemon's own Git would run as the daemon's user against it. Every native branch 
 default workload user's runner, exactly as on a runner. The embedded live Git tracking is not
 ported there, like on runners, so the API answers its Git state with `404` and a message saying
 why.
+
+## Scan workers deny what agent shells deny
+
+On Windows the deny-read ACL state is kept per sandbox group, and each sandbox setup reconciles the
+group to the set it was given, revoking anything else. Agent shells are given the daemon's own
+state directory (token, databases) through the compute module's host policy; scan workers were
+created without it, so each worker setup revoked that deny (dozens of times a day in the sandbox
+log), and while it was revoked a sandboxed command could read the daemon's credentials. Scan
+workers now take the same host policy from the compute module. A worker that denies less than the
+shell undoes the shell's protection, so never create a sandboxed Git command with a narrower
+policy.

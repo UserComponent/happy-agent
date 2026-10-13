@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import {
     computePermissions,
     createHostCommandWorker,
+    type ComputeHostPolicy,
     type HostCommandWorker,
 } from "@slopus/happy-agent-compute";
 import type { RootContext } from "@steve.kite/stdlib";
@@ -25,11 +26,15 @@ import { runScanGitInWorker, scanEnvironment, type ScanGitRunner } from "../runS
  * Eviction never stops a busy worker (a scan is still running), a held one, or one the tracker
  * follows, because stopping those fails a scan or costs a sandbox logon to restart. When nothing
  * can be evicted the count stays over the limit and shrinks as workers become idle.
+ *
+ * Workers use the same host policy as agent shells, because the deny set is per sandbox group
+ * and a smaller set would revoke the shell's denies.
  */
 export class GitScanWorkers {
     /** Scans in flight per worker key; the worker itself exposes no busy state. */
     readonly #busy = new Map<string, number>();
     readonly #held = new Map<string, number>();
+    readonly #hostPolicy: () => ComputeHostPolicy | undefined;
     readonly #limit: () => number;
     readonly #lifetime: () => RootContext;
     readonly #tracked: () => Iterable<string>;
@@ -37,12 +42,19 @@ export class GitScanWorkers {
 
     /**
      * `tracked` names the repository paths the Git tracker currently follows; `limit` is the
-     * number of workers to keep, read whenever a worker is created or finishes work.
+     * number of workers to keep, read whenever a worker is created or finishes work. `hostPolicy`
+     * is read whenever a worker is created.
      */
-    constructor(lifetime: () => RootContext, tracked: () => Iterable<string>, limit: () => number) {
+    constructor(
+        lifetime: () => RootContext,
+        tracked: () => Iterable<string>,
+        limit: () => number,
+        hostPolicy: () => ComputeHostPolicy | undefined,
+    ) {
         this.#lifetime = lifetime;
         this.#tracked = tracked;
         this.#limit = limit;
+        this.#hostPolicy = hostPolicy;
     }
 
     /** The scan runner that routes each read to its workspace's worker. */
@@ -128,10 +140,12 @@ export class GitScanWorkers {
             this.#workers.set(key, existing);
             return existing;
         }
+        const hostPolicy = this.#hostPolicy();
         const worker = createHostCommandWorker({
             ctx: this.#lifetime().named("git-scan-worker"),
             cwd,
             environment: scanEnvironment(cwd, gitCeilingDirectories),
+            ...(hostPolicy === undefined ? {} : { hostPolicy }),
             keepAlive: () => this.#inUse(path),
             permissions: computePermissions("read_only"),
         });
