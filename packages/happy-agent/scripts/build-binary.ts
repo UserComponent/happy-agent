@@ -1,9 +1,17 @@
-import { existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    realpathSync,
+    readdirSync,
+    writeFileSync,
+} from "node:fs";
 import { copyFile, mkdir, mkdtemp } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { createRequire, type Require } from "node:module";
 import { basename, dirname, extname, join, resolve } from "node:path";
 
+import { orderIconLargestFirst } from "./orderIconLargestFirst.js";
 import { resolveBinaryVersion } from "./resolveBinaryVersion.js";
 import { resolveTailcatBinaryAsset } from "./resolveTailcatBinaryAsset.js";
 import { windowsExecutableVersion } from "./windowsExecutableVersion.js";
@@ -140,7 +148,7 @@ async function buildTarget(target: BinaryTarget): Promise<void> {
                       windows: {
                           icon: resolveWindowsIcon(),
                           title: "Happy Agent",
-                          publisher: "Happy",
+                          publisher: "Slopus",
                           description: "Happy Agent",
                           version: windowsExecutableVersion(version),
                       },
@@ -274,7 +282,11 @@ function resolveWindowsIcon(): string {
         "happy.ico",
     );
     if (!existsSync(icon)) throw new Error(`The Windows executable icon is missing: ${icon}`);
-    return icon;
+    // Bun keeps its own first icon group, which shows RT_ICON id 1, so the largest image must be first.
+    const ordered = join(happyAgentRoot, "dist", "windows", "happy-agent.ico");
+    mkdirSync(dirname(ordered), { recursive: true });
+    writeFileSync(ordered, orderIconLargestFirst(readFileSync(icon)));
+    return ordered;
 }
 
 function readPackageVersion(): string {
