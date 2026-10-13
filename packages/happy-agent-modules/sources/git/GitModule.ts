@@ -28,6 +28,7 @@ import { RunnerGitCredentialTunnel } from "./impl/RunnerGitCredentialTunnel.js";
 import { runnerGitCommandRunner, runnerScanGit } from "./impl/runnerGitRunners.js";
 import { WorkingTreeWatcher, type WorkingTreeObserver } from "./impl/WorkingTreeWatcher.js";
 import { isGitWorktreeAt } from "./isGitWorktreeAt.js";
+import { listGitBranches, type GitBranchList } from "./listGitBranches.js";
 import { listGitWorkingTreeFiles, type GitWorkingTreeFiles } from "./listGitWorkingTreeFiles.js";
 import { normalizeFuturePath } from "./normalizeFuturePath.js";
 import { normalizeProjectCwd } from "./normalizeProjectCwd.js";
@@ -56,6 +57,7 @@ import {
     type ScanGitRunner,
 } from "./runScanGit.js";
 import { scanGitRepository } from "./scanGitRepository.js";
+import { selectGitBranches } from "./selectGitBranches.js";
 import { selectGitRemoteUrl } from "./selectGitRemoteUrl.js";
 import { supportsRecursiveWorktreeWatch } from "./watchGitRepositoryChanges.js";
 import {
@@ -72,6 +74,8 @@ import {
 } from "./types.js";
 
 const SNAPSHOT_CACHE_MS = 2_000;
+/** How long one branch listing answers a person typing into a branch picker. */
+const BRANCH_CACHE_MS = 5_000;
 const MAX_CACHE_ENTRIES = 32;
 const MAX_SNAPSHOT_FILES = 1_000;
 const MAX_WATCH_ENTITIES = 256;
@@ -174,6 +178,10 @@ export class GitModule implements AgentModule {
     readonly name = "git";
 
     readonly #cache = new Map<string, CachedSnapshot>();
+    readonly #branchCache = new Map<
+        string,
+        { readonly expiresAt: number; readonly list: Promise<GitBranchList | undefined> }
+    >();
     readonly #credentials = new GitCredentialBroker();
     readonly #generation = randomUUID();
     readonly #observers = new Set<GitSnapshotObserver>();
@@ -457,6 +465,41 @@ export class GitModule implements AgentModule {
             runGit: this.#machine(options.runnerId).scan,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
         });
+    }
+
+    /**
+     * The branches a repository already knows that match what a person is typing, for choosing a
+     * comparison branch. One read-only Git process lists every branch, without fetching; the list
+     * answers every query for a few seconds, so typing filters in memory. `undefined` when the
+     * folder is not a repository.
+     */
+    async branches(
+        path: string,
+        options: { readonly limit: number; readonly query: string },
+    ): Promise<GitBranchList | undefined> {
+        const now = Date.now();
+        for (const [key, cached] of this.#branchCache) {
+            if (cached.expiresAt <= now) this.#branchCache.delete(key);
+        }
+        let cached = this.#branchCache.get(path);
+        if (cached === undefined) {
+            while (this.#branchCache.size >= MAX_CACHE_ENTRIES) {
+                const oldest = this.#branchCache.keys().next().value as string | undefined;
+                if (oldest === undefined) break;
+                this.#branchCache.delete(oldest);
+            }
+            const list = listGitBranches({ path, runGit: this.#scan });
+            cached = { expiresAt: now + BRANCH_CACHE_MS, list };
+            this.#branchCache.set(path, cached);
+            // A failed listing is not remembered; the next keystroke asks Git again.
+            list.catch(() => {
+                if (this.#branchCache.get(path)?.list === list) this.#branchCache.delete(path);
+            });
+        }
+        const list = await cached.list;
+        return list === undefined
+            ? undefined
+            : selectGitBranches(list, options.query, options.limit);
     }
 
     /** How many lines an untracked file adds, and whether it is binary or could not be counted. */

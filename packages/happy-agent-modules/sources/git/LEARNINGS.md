@@ -137,3 +137,14 @@ daemon's own Git would run as the daemon's user against it. Every native branch 
 default workload user's runner, exactly as on a runner. The embedded live Git tracking is not
 ported there, like on runners, so the API answers its Git state with `404` and a message saying
 why.
+
+## A branch picker lists refs once, not per keystroke
+
+The comparison-branch picker asks for matching branches as a person types. Each listing is one
+read-only `for-each-ref` over `refs/heads` and `refs/remotes`, already sorted newest first and
+capped at 2 MiB, through the same scan sandbox as the Git state; it never fetches. The parsed list
+answers every query for that folder for five seconds, so a burst of typing filters in memory
+instead of starting a Git process per keystroke. It lists every remote's branches rather than only
+the compared remote's, because any `<remote>/<branch>` resolves as a comparison base and finding
+the primary remote would cost a second process. It leaves the checked-out branch out, because a
+branch compared with itself measures nothing, and touches no tracker, snapshot, or event.
