@@ -184,6 +184,7 @@ export class GitModule implements AgentModule {
     readonly #scanWorkers = new GitScanWorkers(
         () => this.#root(),
         () => this.#tracker?.paths() ?? [],
+        () => this.#config?.gitScanWorkerLimit ?? 32,
     );
     /** Each running agent's hold on its folder's scan worker, released when the run settles. */
     readonly #runHolds = new Map<string, () => void>();
@@ -252,6 +253,8 @@ export class GitModule implements AgentModule {
      */
     readonly beforeStart = async (ctx: Context): Promise<AgentModuleHooks> => {
         this.#lifetime ??= detach(ctx);
+        const warning = this.#config?.gitScanWorkerLimitWarning;
+        if (warning !== undefined) ctx.log.warn(warning);
         await this.#snapshots?.load();
         return this.#hooks;
     };

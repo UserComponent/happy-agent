@@ -9,9 +9,6 @@ import type { RootContext } from "@steve.kite/stdlib";
 
 import { runScanGitInWorker, scanEnvironment, type ScanGitRunner } from "../runScanGit.js";
 
-/** Workspaces whose idle workers are kept; the least recently used one beyond this is stopped. */
-const MAXIMUM_WORKERS = 32;
-
 /**
  * One long-lived read-only sandbox per workspace for Windows Git scans.
  *
@@ -23,24 +20,45 @@ const MAXIMUM_WORKERS = 32;
  * It keeps running while the tracker follows the workspace or an agent run holds it, and stops
  * five idle minutes after neither is true. Being tracked never starts a worker by itself, so a
  * daemon with many background workspaces starts only the sandboxes that actually scan.
+ *
+ * `limit` caps how many workers are kept; beyond it the least recently used one is stopped.
+ * Eviction never stops a busy worker (a scan is still running), a held one, or one the tracker
+ * follows, because stopping those fails a scan or costs a sandbox logon to restart. When nothing
+ * can be evicted the count stays over the limit and shrinks as workers become idle.
  */
 export class GitScanWorkers {
+    /** Scans in flight per worker key; the worker itself exposes no busy state. */
+    readonly #busy = new Map<string, number>();
     readonly #held = new Map<string, number>();
+    readonly #limit: () => number;
     readonly #lifetime: () => RootContext;
     readonly #tracked: () => Iterable<string>;
     readonly #workers = new Map<string, HostCommandWorker>();
 
-    /** `tracked` names the repository paths the Git tracker currently follows. */
-    constructor(lifetime: () => RootContext, tracked: () => Iterable<string>) {
+    /**
+     * `tracked` names the repository paths the Git tracker currently follows; `limit` is the
+     * number of workers to keep, read whenever a worker is created or finishes work.
+     */
+    constructor(lifetime: () => RootContext, tracked: () => Iterable<string>, limit: () => number) {
         this.#lifetime = lifetime;
         this.#tracked = tracked;
+        this.#limit = limit;
     }
 
     /** The scan runner that routes each read to its workspace's worker. */
     scanner(gitCeilingDirectories: () => string | undefined): ScanGitRunner {
         return async (options) => {
+            const key = this.#key(options.cwd, gitCeilingDirectories());
             const worker = this.#worker(options.cwd, gitCeilingDirectories());
-            return await runScanGitInWorker(worker, options);
+            this.#busy.set(key, (this.#busy.get(key) ?? 0) + 1);
+            try {
+                return await runScanGitInWorker(worker, options);
+            } finally {
+                const count = (this.#busy.get(key) ?? 1) - 1;
+                if (count <= 0) this.#busy.delete(key);
+                else this.#busy.set(key, count);
+                this.#trim(undefined);
+            }
         };
     }
 
@@ -59,6 +77,7 @@ export class GitScanWorkers {
             const count = (this.#held.get(path) ?? 1) - 1;
             if (count <= 0) this.#held.delete(path);
             else this.#held.set(path, count);
+            this.#trim(undefined);
         };
     }
 
@@ -67,6 +86,7 @@ export class GitScanWorkers {
         const workers = Array.from(this.#workers.values());
         this.#workers.clear();
         this.#held.clear();
+        this.#busy.clear();
         for (const worker of workers) void worker.dispose();
     }
 
@@ -78,9 +98,29 @@ export class GitScanWorkers {
         return false;
     }
 
+    #key(cwd: string, gitCeilingDirectories: string | undefined): string {
+        return `${pathKey(cwd)}\0${gitCeilingDirectories ?? ""}`;
+    }
+
+    /** Stops least recently used workers beyond the limit, skipping any that are in use. */
+    #trim(keep: string | undefined): void {
+        const limit = this.#limit();
+        if (this.#workers.size <= limit) return;
+        const tracked = new Set<string>();
+        for (const path of this.#tracked()) tracked.add(pathKey(path));
+        for (const [key, worker] of Array.from(this.#workers)) {
+            if (this.#workers.size <= limit) break;
+            if (key === keep || this.#busy.has(key)) continue;
+            const path = key.slice(0, key.indexOf("\0"));
+            if (this.#held.has(path) || tracked.has(path)) continue;
+            this.#workers.delete(key);
+            void worker.dispose();
+        }
+    }
+
     #worker(cwd: string, gitCeilingDirectories: string | undefined): HostCommandWorker {
         const path = pathKey(cwd);
-        const key = `${path}\0${gitCeilingDirectories ?? ""}`;
+        const key = this.#key(cwd, gitCeilingDirectories);
         const existing = this.#workers.get(key);
         if (existing !== undefined) {
             // Reinsert so the map stays ordered from least to most recently used.
@@ -96,11 +136,7 @@ export class GitScanWorkers {
             permissions: computePermissions("read_only"),
         });
         this.#workers.set(key, worker);
-        for (const [oldest, idle] of this.#workers) {
-            if (this.#workers.size <= MAXIMUM_WORKERS) break;
-            this.#workers.delete(oldest);
-            void idle.dispose();
-        }
+        this.#trim(key);
         return worker;
     }
 }

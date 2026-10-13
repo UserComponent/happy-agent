@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 
 interface FakeWorker {
     cwd: string;
+    disposed: boolean;
     keepAlive: () => boolean;
+    pending: Array<() => void>;
+    /** When set, `run` waits until the test releases it. */
+    hold: boolean;
     warmed: number;
 }
 
@@ -12,17 +16,29 @@ const created: FakeWorker[] = [];
 vi.mock("@slopus/happy-agent-compute", () => ({
     computePermissions: (mode: string) => ({ mode, network: { egress: false } }),
     createHostCommandWorker: (options: { cwd: string; keepAlive: () => boolean }) => {
-        const worker: FakeWorker = { cwd: options.cwd, keepAlive: options.keepAlive, warmed: 0 };
+        const worker: FakeWorker = {
+            cwd: options.cwd,
+            disposed: false,
+            hold: false,
+            keepAlive: options.keepAlive,
+            pending: [],
+            warmed: 0,
+        };
         created.push(worker);
         return {
-            dispose: async () => undefined,
-            run: async () => ({
-                exitCode: 0,
-                stderr: "",
-                stdout: Buffer.alloc(0),
-                timedOut: false,
-                truncated: false,
-            }),
+            dispose: async () => {
+                worker.disposed = true;
+            },
+            run: async () => {
+                if (worker.hold) await new Promise<void>((done) => worker.pending.push(done));
+                return {
+                    exitCode: 0,
+                    stderr: "",
+                    stdout: Buffer.alloc(0),
+                    timedOut: false,
+                    truncated: false,
+                };
+            },
             warm: () => {
                 worker.warmed += 1;
             },
@@ -40,6 +56,7 @@ describe("GitScanWorkers", () => {
         const workers = new GitScanWorkers(
             () => root,
             () => tracked,
+            () => 32,
         );
         const folder = process.platform === "win32" ? "C:\\Work\\Repo" : "/work/repo";
 
@@ -72,6 +89,7 @@ describe("GitScanWorkers", () => {
         const workers = new GitScanWorkers(
             () => root,
             () => [],
+            () => 32,
         );
         const folder = process.platform === "win32" ? "C:\\Work\\Shared" : "/work/shared";
         const first = workers.hold(folder, undefined);
@@ -81,5 +99,92 @@ describe("GitScanWorkers", () => {
         second();
         expect(created[0]!.keepAlive()).toBe(false);
         workers.dispose();
+    });
+
+    describe("with a limit of two workers", () => {
+        const folder = (name: string) =>
+            process.platform === "win32" ? `C:\\Work\\${name}` : `/work/${name}`;
+        const make = (tracked: () => string[] = () => []) => {
+            created.length = 0;
+            const workers = new GitScanWorkers(
+                () => createRootContext(),
+                tracked,
+                () => 2,
+            );
+            return { scan: workers.scanner(() => undefined), workers };
+        };
+        const worker = (name: string) => created.find((entry) => entry.cwd === folder(name))!;
+        const scanOf = (scan: ReturnType<typeof make>["scan"], name: string) =>
+            scan({ args: ["status"], cwd: folder(name) });
+
+        it("stops the least recently used idle worker", async () => {
+            const { scan, workers } = make();
+            await scanOf(scan, "a");
+            await scanOf(scan, "b");
+            await scanOf(scan, "c");
+            expect(worker("a").disposed).toBe(true);
+            expect(worker("b").disposed).toBe(false);
+            expect(worker("c").disposed).toBe(false);
+            workers.dispose();
+        });
+
+        it("never stops a worker whose scan is still running", async () => {
+            const { scan, workers } = make();
+            await scanOf(scan, "a");
+            worker("a").hold = true;
+            const pending = scanOf(scan, "a");
+            await scanOf(scan, "b");
+            await scanOf(scan, "c");
+            expect(worker("a").disposed).toBe(false);
+            expect(worker("b").disposed).toBe(true);
+            worker("a").pending.forEach((done) => done());
+            await expect(pending).resolves.toBeDefined();
+            workers.dispose();
+        });
+
+        it("never stops a held worker", async () => {
+            const { scan, workers } = make();
+            workers.hold(folder("a"), undefined);
+            await scanOf(scan, "b");
+            await scanOf(scan, "c");
+            expect(worker("a").disposed).toBe(false);
+            expect(worker("b").disposed).toBe(true);
+            workers.dispose();
+        });
+
+        it("never stops a tracked worker", async () => {
+            const { scan, workers } = make(() => [folder("a")]);
+            await scanOf(scan, "a");
+            await scanOf(scan, "b");
+            await scanOf(scan, "c");
+            expect(worker("a").disposed).toBe(false);
+            expect(worker("b").disposed).toBe(true);
+            workers.dispose();
+        });
+
+        it("goes over the limit when nothing can be stopped and trims once work finishes", async () => {
+            const { scan, workers } = make();
+            await scanOf(scan, "a");
+            await scanOf(scan, "b");
+            worker("a").hold = true;
+            worker("b").hold = true;
+            const first = scanOf(scan, "a");
+            const second = scanOf(scan, "b");
+            // A held third worker joins while both others are mid-scan, so nothing can be stopped.
+            const release = workers.hold(folder("c"), undefined);
+            expect(created.filter((entry) => !entry.disposed)).toHaveLength(3);
+
+            await vi.waitFor(() => expect(worker("a").pending).toHaveLength(1));
+            worker("a").pending.forEach((done) => done());
+            await first;
+            // The scan finished, so the idle worker beyond the limit goes.
+            expect(worker("a").disposed).toBe(true);
+            expect(created.filter((entry) => !entry.disposed)).toHaveLength(2);
+            await vi.waitFor(() => expect(worker("b").pending).toHaveLength(1));
+            worker("b").pending.forEach((done) => done());
+            await second;
+            release();
+            workers.dispose();
+        });
     });
 });
