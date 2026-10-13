@@ -1013,7 +1013,7 @@ index 2624607..40189d0 100644
 +    panic!("happy-sandbox-setup is Windows-only");
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
-index f80efe4..af8fae8 100644
+index f80efe4..446c069 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
 +++ b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win.rs
 @@ -7,7 +7,11 @@ use base64::Engine;
@@ -1145,7 +1145,15 @@ index f80efe4..af8fae8 100644
          if local_user_flags(username)?.is_some_and(|flags| flags & UF_ACCOUNTDISABLE != 0) {
              repairing_disabled_accounts = true;
          }
-@@ -692,35 +692,34 @@ fn provision_sandbox(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
+@@ -681,7 +681,6 @@ fn provision_sandbox(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
+         &payload.online_username,
+         new_user_flags,
+         log,
+-        payload.mode,
+     );
+     if let Err(err) = provision_result {
+         if extract_setup_failure(&err).is_some() {
+@@ -692,35 +691,34 @@ fn provision_sandbox(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
              format!("provision sandbox users failed: {err}"),
          )));
      }
@@ -1200,7 +1208,7 @@ index f80efe4..af8fae8 100644
              let flags = local_user_flags(username)?.ok_or_else(|| {
                  anyhow::anyhow!("sandbox user {username} disappeared during repair")
              })?;
-@@ -732,11 +731,11 @@ fn provision_sandbox(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
+@@ -732,11 +730,11 @@ fn provision_sandbox(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
  
  fn configure_offline_sandbox_network(
      payload: &Payload,
@@ -1214,7 +1222,7 @@ index f80efe4..af8fae8 100644
          &payload.proxy_ports,
          payload.allow_local_binding,
          log,
-@@ -750,7 +749,7 @@ fn configure_offline_sandbox_network(
+@@ -750,7 +748,7 @@ fn configure_offline_sandbox_network(
              format!("ensure offline proxy allowlist failed: {err}"),
          )));
      }
@@ -1223,7 +1231,7 @@ index f80efe4..af8fae8 100644
      if let Err(err) = firewall_result {
          if extract_setup_failure(&err).is_some() {
              return Err(err);
-@@ -870,18 +869,50 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
+@@ -870,18 +868,50 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
  
      let mut refresh_errors: Vec<String> = Vec::new();
  
@@ -1278,7 +1286,7 @@ index f80efe4..af8fae8 100644
      if !applied_deny_read_paths.is_empty() {
          log_line(
              log,
-@@ -889,45 +920,14 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
+@@ -889,45 +919,14 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
          )?;
      }
  
@@ -1331,7 +1339,7 @@ index f80efe4..af8fae8 100644
  
      let mut grant_tasks: Vec<(PathBuf, String)> = Vec::new();
  
-@@ -1090,7 +1090,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
+@@ -1090,7 +1089,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
          log_line(
              log,
              &format!(
@@ -1340,7 +1348,7 @@ index f80efe4..af8fae8 100644
                  payload.write_roots.len(),
                  refresh_errors
              ),
-@@ -1144,8 +1144,8 @@ mod tests {
+@@ -1144,8 +1143,8 @@ mod tests {
      fn payload_json() -> serde_json::Value {
          json!({
              "version": SETUP_VERSION,
@@ -1658,13 +1666,24 @@ index a96b6a5..926641c 100644
 +    Ok(ReadAclMutexGuard { handle })
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs
-index 698d7e1..884dd54 100644
+index 698d7e1..1ca40c7 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs
 +++ b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs
-@@ -19,7 +19,12 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+@@ -4,7 +4,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
+ use rand::RngCore;
+ use rand::SeedableRng;
+ use rand::rngs::SmallRng;
++use serde::Deserialize;
+ use serde::Serialize;
++use std::collections::HashMap;
+ use std::ffi::OsStr;
+ use std::ffi::c_void;
+ use std::fs::File;
+@@ -19,7 +21,13 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
  use windows_sys::Win32::Foundation::LocalFree;
  use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_MEMBERS_INFO_3;
  use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
++use windows_sys::Win32::NetworkManagement::NetManagement::NERR_UserExists;
 +use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_USERS_INFO_0;
 +use windows_sys::Win32::NetworkManagement::NetManagement::LG_INCLUDE_INDIRECT;
 +use windows_sys::Win32::NetworkManagement::NetManagement::MAX_PREFERRED_LENGTH;
@@ -1674,7 +1693,7 @@ index 698d7e1..884dd54 100644
  use windows_sys::Win32::NetworkManagement::NetManagement::NetUserAdd;
  use windows_sys::Win32::NetworkManagement::NetManagement::NetUserSetInfo;
  use windows_sys::Win32::NetworkManagement::NetManagement::UF_DONT_EXPIRE_PASSWD;
-@@ -38,11 +43,15 @@ use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
+@@ -38,11 +46,16 @@ use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
  use windows_sys::Win32::Storage::FileSystem::CreateFileW;
  use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
  
@@ -1686,13 +1705,16 @@ index 698d7e1..884dd54 100644
  use codex_windows_sandbox::SetupErrorCode;
  use codex_windows_sandbox::SetupFailure;
  use codex_windows_sandbox::dpapi_protect;
++use codex_windows_sandbox::dpapi_unprotect;
 +use codex_windows_sandbox::ensure_sandbox_external_users_group;
  use codex_windows_sandbox::ensure_sandbox_users_group;
  use codex_windows_sandbox::resolve_sid;
  use codex_windows_sandbox::sandbox_dir;
-@@ -67,33 +76,100 @@ pub(super) fn provision_sandbox_users(
+@@ -65,42 +78,115 @@ pub(super) fn provision_sandbox_users(
+     online_username: &str,
+     new_user_flags: u32,
      log: &mut dyn Write,
-     mode: SetupMode,
+-    mode: SetupMode,
  ) -> Result<()> {
 -    if let Err(err) = ensure_sandbox_users_group() {
 -        let message = format!("failed to create local group {SANDBOX_USERS_GROUP}: {err}");
@@ -1741,10 +1763,14 @@ index 698d7e1..884dd54 100644
 +        (OFFLINE_EXTERNAL_USERNAME, true),
 +        (ONLINE_EXTERNAL_USERNAME, true),
 +    ];
++    // Accounts that already have a recorded password keep it. A command may be logging on as one
++    // of them right now, and resetting the password would fail that logon until repair.
++    let existing = read_existing_passwords(codex_home, offline_username, online_username);
++    let names: Vec<&str> = accounts.iter().map(|(username, _)| *username).collect();
++    let planned = plan_passwords(&names, &existing, random_password);
 +    let mut credentials = Vec::with_capacity(accounts.len());
-+    for (username, external) in accounts {
-+        let password = random_password();
-+        ensure_sandbox_user(username, &password, new_user_flags, log)?;
++    for ((username, external), (password, keeps_password)) in accounts.into_iter().zip(planned) {
++        ensure_sandbox_user(username, &password, keeps_password, new_user_flags, log)?;
 +        // The external accounts' only difference is the profile deny on their own group. If that
 +        // membership were missing they would read the profile, so it is proven, never assumed.
 +        // Their shared-group membership carries the deny on the setup secrets.
@@ -1756,7 +1782,7 @@ index 698d7e1..884dd54 100644
 +        }
 +        credentials.push((username, password));
 +    }
-+    write_secrets(codex_home, &credentials, mode)?;
++    write_secrets(codex_home, &credentials)?;
      Ok(())
  }
  
@@ -1808,10 +1834,39 @@ index 698d7e1..884dd54 100644
 +    )))
 +}
 +
++/// With `keeps_password`, `password` is already the account's password: an account that exists is
++/// left alone instead of being reset, and one that does not is created with it.
  pub fn ensure_sandbox_user(
      username: &str,
      password: &str,
-@@ -292,6 +368,8 @@ struct SandboxUsersFile {
++    keeps_password: bool,
+     new_user_flags: u32,
+     log: &mut dyn Write,
+ ) -> Result<()> {
+-    ensure_local_user(username, password, new_user_flags, log)?;
++    ensure_local_user(username, password, keeps_password, new_user_flags, log)?;
+     ensure_local_group_member(SANDBOX_USERS_GROUP, username)?;
+     Ok(())
+ }
+@@ -108,6 +194,7 @@ pub fn ensure_sandbox_user(
+ pub fn ensure_local_user(
+     name: &str,
+     password: &str,
++    keeps_password: bool,
+     new_user_flags: u32,
+     log: &mut dyn Write,
+ ) -> Result<()> {
+@@ -130,7 +217,8 @@ pub fn ensure_local_user(
+             &info as *const _ as *mut u8,
+             std::ptr::null_mut(),
+         );
+-        if status != NERR_Success {
++        // An existing account that already has this password needs no update.
++        if status != NERR_Success && !(keeps_password && status == NERR_UserExists) {
+             // Try update password via level 1003.
+             let pw_info = USER_INFO_1003 {
+                 usri1003_password: pwd_w.as_ptr() as *mut u16,
+@@ -292,6 +380,8 @@ struct SandboxUsersFile {
      version: u32,
      offline: SandboxUserRecord,
      online: SandboxUserRecord,
@@ -1820,19 +1875,90 @@ index 698d7e1..884dd54 100644
  }
  
  #[derive(Serialize)]
-@@ -308,10 +386,7 @@ struct SetupMarker {
+@@ -306,14 +396,75 @@ struct SetupMarker {
+     write_roots: Vec<PathBuf>,
+ }
  
- fn write_secrets(
+-fn write_secrets(
++#[derive(Deserialize)]
++struct StoredUserRecord {
++    username: String,
++    password: String,
++}
++
++#[derive(Deserialize)]
++struct StoredUsersFile {
++    offline: StoredUserRecord,
++    online: StoredUserRecord,
++    #[serde(default)]
++    external_offline: Option<StoredUserRecord>,
++    #[serde(default)]
++    external_online: Option<StoredUserRecord>,
++}
++
++/// The passwords of the accounts an earlier setup recorded, by account name. The record is used
++/// only when it names this installation's shared pair and every password in it decrypts; if it
++/// cannot be read as a whole, nothing is reused and every account gets a new password.
++fn read_existing_passwords(
      codex_home: &Path,
 -    offline_user: &str,
 -    offline_pwd: &str,
 -    online_user: &str,
 -    online_pwd: &str,
-+    credentials: &[(&str, String)],
-     mode: SetupMode,
- ) -> Result<()> {
+-    mode: SetupMode,
+-) -> Result<()> {
++    offline_username: &str,
++    online_username: &str,
++) -> HashMap<String, String> {
++    let path = sandbox_secrets_dir(codex_home).join("sandbox_users.json");
++    let Ok(stored) = std::fs::read(&path)
++        .map_err(anyhow::Error::from)
++        .and_then(|bytes| Ok(serde_json::from_slice::<StoredUsersFile>(&bytes)?))
++    else {
++        return HashMap::new();
++    };
++    if stored.offline.username != offline_username || stored.online.username != online_username {
++        return HashMap::new();
++    }
++    let mut passwords = HashMap::new();
++    for record in [Some(stored.offline), Some(stored.online), stored.external_offline, stored.external_online]
++        .into_iter()
++        .flatten()
++    {
++        let password = BASE64
++            .decode(record.password.as_bytes())
++            .map_err(anyhow::Error::from)
++            .and_then(|blob| dpapi_unprotect(&blob))
++            .and_then(|plain| Ok(String::from_utf8(plain)?));
++        match password {
++            Ok(password) => passwords.insert(record.username, password),
++            Err(_) => return HashMap::new(),
++        };
++    }
++    passwords
++}
++
++/// Chooses each account's password, and whether it is one the account already has. Only an
++/// account with no recorded password gets a generated one.
++fn plan_passwords(
++    accounts: &[&str],
++    existing: &HashMap<String, String>,
++    mut generate: impl FnMut() -> String,
++) -> Vec<(String, bool)> {
++    accounts
++        .iter()
++        .map(|username| match existing.get(*username) {
++            Some(password) => (password.clone(), true),
++            None => (generate(), false),
++        })
++        .collect()
++}
++
++fn write_secrets(codex_home: &Path, credentials: &[(&str, String)]) -> Result<()> {
      let secrets_dir = sandbox_secrets_dir(codex_home);
-@@ -324,28 +399,27 @@ fn write_secrets(
+     std::fs::create_dir_all(&secrets_dir).map_err(|err| {
+         anyhow::Error::new(SetupFailure::new(
+@@ -324,28 +475,27 @@ fn write_secrets(
              ),
          ))
      })?;
@@ -1880,6 +2006,134 @@ index 698d7e1..884dd54 100644
      };
      let users_path = secrets_dir.join("sandbox_users.json");
      let users_json = serde_json::to_vec_pretty(&users).map_err(|err| {
+@@ -354,13 +504,9 @@ fn write_secrets(
+             format!("serialize sandbox users failed: {err}"),
+         ))
+     })?;
+-    let write_result = match mode {
+-        SetupMode::ProvisionOnly => write_file_atomically(&users_path, &users_json),
+-        SetupMode::Full | SetupMode::InteractiveProvision | SetupMode::ReadAclsOnly => {
+-            std::fs::write(&users_path, users_json).map_err(anyhow::Error::from)
+-        }
+-    };
+-    write_result.map_err(|err| {
++    // Replaced in one step, so a command reading the file while setup runs sees the old
++    // passwords or the new ones, never a partial file.
++    write_file_atomically(&users_path, &users_json).map_err(|err| {
+         anyhow::Error::new(SetupFailure::new(
+             SetupErrorCode::HelperUsersFileWriteFailed,
+             format!(
+@@ -511,3 +657,110 @@ pub(super) fn commit_setup_marker(
+     })?;
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const OFFLINE: &str = "HappySandboxOffline";
++    const ONLINE: &str = "HappySandboxOnline";
++    const ACCOUNTS: [&str; 4] = [
++        OFFLINE,
++        ONLINE,
++        OFFLINE_EXTERNAL_USERNAME,
++        ONLINE_EXTERNAL_USERNAME,
++    ];
++
++    fn stored(username: &str, password: &str) -> serde_json::Value {
++        serde_json::json!({
++            "username": username,
++            "password": BASE64.encode(dpapi_protect(password.as_bytes()).expect("protect")),
++        })
++    }
++
++    fn write_users(codex_home: &Path, users: serde_json::Value) {
++        let dir = sandbox_secrets_dir(codex_home);
++        std::fs::create_dir_all(&dir).expect("create secrets dir");
++        std::fs::write(dir.join("sandbox_users.json"), users.to_string()).expect("write users");
++    }
++
++    #[test]
++    fn only_accounts_without_a_recorded_password_get_a_new_one() {
++        let existing = HashMap::from([
++            (OFFLINE.to_string(), "old-offline".to_string()),
++            (ONLINE.to_string(), "old-online".to_string()),
++        ]);
++        let mut generated = 0;
++        let planned = plan_passwords(&ACCOUNTS, &existing, || {
++            generated += 1;
++            format!("new-{generated}")
++        });
++        assert_eq!(
++            planned,
++            vec![
++                ("old-offline".to_string(), true),
++                ("old-online".to_string(), true),
++                ("new-1".to_string(), false),
++                ("new-2".to_string(), false),
++            ]
++        );
++    }
++
++    #[test]
++    fn without_a_record_every_account_gets_a_new_password() {
++        let mut generated = 0;
++        let planned = plan_passwords(&ACCOUNTS, &HashMap::new(), || {
++            generated += 1;
++            format!("new-{generated}")
++        });
++        assert_eq!(planned.len(), 4);
++        assert!(planned.iter().all(|(_, keeps)| !keeps));
++    }
++
++    #[test]
++    fn a_readable_record_of_the_shared_pair_is_reused() {
++        let home = tempfile::tempdir().expect("tempdir");
++        write_users(
++            home.path(),
++            serde_json::json!({
++                "version": 9,
++                "offline": stored(OFFLINE, "old-offline"),
++                "online": stored(ONLINE, "old-online"),
++            }),
++        );
++        let existing = read_existing_passwords(home.path(), OFFLINE, ONLINE);
++        assert_eq!(existing.len(), 2);
++        assert_eq!(existing[OFFLINE], "old-offline");
++        assert_eq!(existing[ONLINE], "old-online");
++    }
++
++    #[test]
++    fn a_record_that_cannot_be_read_as_a_whole_reuses_nothing() {
++        let home = tempfile::tempdir().expect("tempdir");
++        // No file.
++        assert!(read_existing_passwords(home.path(), OFFLINE, ONLINE).is_empty());
++        // Not a record.
++        let dir = sandbox_secrets_dir(home.path());
++        std::fs::create_dir_all(&dir).expect("create secrets dir");
++        std::fs::write(dir.join("sandbox_users.json"), "not json").expect("write users");
++        assert!(read_existing_passwords(home.path(), OFFLINE, ONLINE).is_empty());
++        // Another installation's accounts.
++        write_users(
++            home.path(),
++            serde_json::json!({
++                "offline": stored("CodexSandboxOffline", "x"),
++                "online": stored("CodexSandboxOnline", "y"),
++            }),
++        );
++        assert!(read_existing_passwords(home.path(), OFFLINE, ONLINE).is_empty());
++        // One password that does not decrypt discards the whole record.
++        write_users(
++            home.path(),
++            serde_json::json!({
++                "offline": stored(OFFLINE, "old-offline"),
++                "online": { "username": ONLINE, "password": "AAAA" },
++            }),
++        );
++        assert!(read_existing_passwords(home.path(), OFFLINE, ONLINE).is_empty());
++    }
++}
 diff --git a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win_acl_tests.rs b/codex-rs/windows-sandbox-rs/src/bin/setup_main/win_acl_tests.rs
 index df39cfd..157dec0 100644
 --- a/codex-rs/windows-sandbox-rs/src/bin/setup_main/win_acl_tests.rs
@@ -2630,10 +2884,10 @@ index 702884a..ef0427d 100644
                  || {
 diff --git a/codex-rs/windows-sandbox-rs/src/happy_setup_gate.rs b/codex-rs/windows-sandbox-rs/src/happy_setup_gate.rs
 new file mode 100644
-index 0000000..f73354f
+index 0000000..80b92fe
 --- /dev/null
 +++ b/codex-rs/windows-sandbox-rs/src/happy_setup_gate.rs
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,726 @@
 +//! One installation setup attempt, shared by every supervisor process.
 +//! A failed or interrupted UAC attempt stays latched until an explicit retry.
 +
@@ -2642,6 +2896,8 @@ index 0000000..f73354f
 +use std::fs;
 +use std::io::Write;
 +use std::path::{Path, PathBuf};
++
++use crate::setup::SandboxScope;
 +
 +/// The real Windows profile, never an app/project or inherited HOME override.
 +pub fn default_state_directory() -> Result<PathBuf> {
@@ -2746,10 +3002,26 @@ index 0000000..f73354f
 +    Explicit,
 +    Retry,
 +    Disabled,
++    /// A launch nobody is waiting on, such as a Git scan. It never opens the administrator prompt.
++    Background,
++}
++
++const PROFILE_LATCH: &str = "setup-attempt.json";
++const EXTERNAL_LATCH: &str = "setup-attempt-external.json";
++
++fn read_latch(path: &Path) -> Result<Option<Attempt>> {
++    match fs::read(path) {
++        Ok(bytes) => Ok(Some(
++            serde_json::from_slice(&bytes).context("read Happy setup attempt outcome")?,
++        )),
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(err).context("read Happy setup attempt outcome"),
++    }
 +}
 +
 +pub(crate) fn run_setup_attempt(
 +    home: &Path,
++    scope: SandboxScope,
 +    intent: SetupIntent,
 +    ready: impl Fn() -> bool,
 +    automatic_allowed: impl Fn() -> Result<bool>,
@@ -2757,6 +3029,16 @@ index 0000000..f73354f
 +) -> Result<()> {
 +    if ready() {
 +        return Ok(());
++    }
++    if intent == SetupIntent::Background {
++        match scope {
++            SandboxScope::Profile => bail!(
++                "Happy needs a one-time administrator approval before it can read Git changes here. Run `happy-agent sandbox setup`, or start an agent in this workspace."
++            ),
++            SandboxScope::External => bail!(
++                "Happy needs a one-time administrator approval before it can read Git changes in folders outside your user folder. Run `happy-agent sandbox setup`, or start an agent in this workspace."
++            ),
++        }
 +    }
 +    if intent == SetupIntent::Automatic && !automatic_allowed()? {
 +        bail!(
@@ -2781,20 +3063,49 @@ index 0000000..f73354f
 +    let boot_id = current_boot_id()?;
 +    let directory = home.join(".sandbox");
 +    fs::create_dir_all(&directory).context("create Happy setup coordination directory")?;
-+    let attempt = directory.join("setup-attempt.json");
-+    if attempt.try_exists()? {
-+        let previous: Attempt = serde_json::from_slice(&fs::read(&attempt)?)
-+            .context("read Happy setup attempt outcome")?;
-+        if intent != SetupIntent::Retry {
-+            bail!(
-+                "A previous Happy Windows sandbox setup attempt did not complete. No additional Windows prompt was opened. Run `happy-agent sandbox setup --retry` when ready to try again."
-+            );
++    // Outside workspaces have their own latch, so a declined outside prompt never blocks a
++    // profile workspace's repair. Every other attempt is recorded in the main one.
++    let main_path = directory.join(PROFILE_LATCH);
++    let external_path = directory.join(EXTERNAL_LATCH);
++    let attempt = if intent == SetupIntent::Automatic && scope == SandboxScope::External {
++        external_path.clone()
++    } else {
++        main_path.clone()
++    };
++    let main = read_latch(&main_path)?;
++    let external = read_latch(&external_path)?;
++    // Two elevated helpers must never overlap, whichever scope started them.
++    if [&main, &external]
++        .into_iter()
++        .flatten()
++        .any(|previous| !previous.completed_failure && previous.boot_id == boot_id)
++    {
++        bail!(
++            "A previous Happy Windows sandbox setup is pending or was interrupted. Finish its existing Windows prompt, or restart Windows before running `happy-agent sandbox setup --retry`. No additional setup was started."
++        );
++    }
++    match intent {
++        SetupIntent::Automatic => {
++            let own = if scope == SandboxScope::External { &external } else { &main };
++            if own.is_some() {
++                match scope {
++                    SandboxScope::Profile => bail!(
++                        "A previous Happy Windows sandbox setup attempt did not complete. No additional Windows prompt was opened. Run `happy-agent sandbox setup --retry` when ready to try again."
++                    ),
++                    SandboxScope::External => bail!(
++                        "Workspaces outside your user folder need a one-time administrator approval. A previous request did not complete. Run `happy-agent sandbox setup --retry` to ask again."
++                    ),
++                }
++            }
 +        }
-+        if !previous.completed_failure && previous.boot_id == boot_id {
-+            bail!(
-+                "A previous Happy Windows sandbox setup is pending or was interrupted. Finish its existing Windows prompt, or restart Windows before running `happy-agent sandbox setup --retry`. No additional setup was started."
-+            );
++        SetupIntent::Explicit => {
++            if main.is_some() || external.is_some() {
++                bail!(
++                    "A previous Happy Windows sandbox setup attempt did not complete. No additional Windows prompt was opened. Run `happy-agent sandbox setup --retry` when ready to try again."
++                );
++            }
 +        }
++        SetupIntent::Retry | SetupIntent::Disabled | SetupIntent::Background => {}
 +    }
 +    let mut record = Attempt {
 +        boot_id,
@@ -2816,10 +3127,16 @@ index 0000000..f73354f
 +            "Happy Windows sandbox setup returned without a usable installation. Run `happy-agent sandbox setup --retry` to try again."
 +        );
 +    }
-+    fs::remove_file(attempt).context("complete Happy setup attempt")?;
++    // Any success provisions every account, so no earlier failure still applies.
++    for path in [&main_path, &external_path] {
++        match fs::remove_file(path) {
++            Ok(()) => {}
++            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++            Err(err) => return Err(err).context("complete Happy setup attempt"),
++        }
++    }
 +    Ok(())
 +}
-+
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
@@ -2828,13 +3145,24 @@ index 0000000..f73354f
 +        atomic::{AtomicBool, AtomicUsize, Ordering},
 +    };
 +
++    // Every attempt that gets past readiness takes the machine-wide setup request mutex without
++    // waiting, so tests running on parallel threads would refuse each other. Each test holds this
++    // for its whole body; a panic in one must not fail the rest.
++    static SETUP_REQUEST_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
++    fn serialize_setup_request_tests() -> std::sync::MutexGuard<'static, ()> {
++        SETUP_REQUEST_TESTS.lock().unwrap_or_else(|error| error.into_inner())
++    }
++
 +    #[test]
 +    fn canceled_attempt_does_not_repeat_until_explicit_retry() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        let calls = AtomicUsize::new(0);
 +        let ready = AtomicBool::new(false);
 +        let error = run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Automatic,
 +            || ready.load(Ordering::SeqCst),
 +            || Ok(true),
@@ -2848,6 +3176,7 @@ index 0000000..f73354f
 +        for intent in [SetupIntent::Automatic, SetupIntent::Explicit] {
 +            let error = run_setup_attempt(
 +                home.path(),
++                SandboxScope::Profile,
 +                intent,
 +                || false,
 +                || Ok(true),
@@ -2862,6 +3191,7 @@ index 0000000..f73354f
 +        assert_eq!(calls.load(Ordering::SeqCst), 1);
 +        run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Retry,
 +            || ready.load(Ordering::SeqCst),
 +            || Ok(true),
@@ -2878,6 +3208,7 @@ index 0000000..f73354f
 +
 +    #[test]
 +    fn concurrent_requests_launch_only_one_provisioner() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        let path = home.path().to_path_buf();
 +        let entered = Arc::new(Barrier::new(2));
@@ -2890,6 +3221,7 @@ index 0000000..f73354f
 +            std::thread::spawn(move || {
 +                run_setup_attempt(
 +                    &path,
++                    SandboxScope::Profile,
 +                    SetupIntent::Automatic,
 +                    || ready.load(Ordering::SeqCst),
 +                    || Ok(true),
@@ -2906,6 +3238,7 @@ index 0000000..f73354f
 +        let other_home = tempfile::tempdir()?;
 +        let error = run_setup_attempt(
 +            other_home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Retry,
 +            || ready.load(Ordering::SeqCst),
 +            || Ok(true),
@@ -2917,6 +3250,7 @@ index 0000000..f73354f
 +        first.join().expect("setup worker")?;
 +        run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Automatic,
 +            || ready.load(Ordering::SeqCst),
 +            || Ok(true),
@@ -2927,11 +3261,13 @@ index 0000000..f73354f
 +
 +    #[test]
 +    fn interrupted_attempt_stays_latched_and_disabled_never_creates_state() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        let absent = home.path().join("absent");
 +        assert!(
 +            run_setup_attempt(
 +                &absent,
++                SandboxScope::Profile,
 +                SetupIntent::Disabled,
 +                || false,
 +                || Ok(true),
@@ -2951,6 +3287,7 @@ index 0000000..f73354f
 +        assert!(
 +            run_setup_attempt(
 +                home.path(),
++                SandboxScope::Profile,
 +                SetupIntent::Automatic,
 +                || false,
 +                || Ok(true),
@@ -2961,6 +3298,7 @@ index 0000000..f73354f
 +        assert!(
 +            run_setup_attempt(
 +                home.path(),
++                SandboxScope::Profile,
 +                SetupIntent::Retry,
 +                || false,
 +                || Ok(true),
@@ -2975,9 +3313,11 @@ index 0000000..f73354f
 +
 +    #[test]
 +    fn uncertain_helper_completion_cannot_be_retried_in_the_same_boot() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        let error = run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Explicit,
 +            || false,
 +            || Ok(true),
@@ -2988,6 +3328,7 @@ index 0000000..f73354f
 +        assert!(
 +            run_setup_attempt(
 +                home.path(),
++                SandboxScope::Profile,
 +                SetupIntent::Retry,
 +                || false,
 +                || Ok(true),
@@ -3000,6 +3341,7 @@ index 0000000..f73354f
 +        // Its authoritative completion can still make the installation usable.
 +        run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Automatic,
 +            || true,
 +            || Ok(true),
@@ -3010,10 +3352,12 @@ index 0000000..f73354f
 +
 +    #[test]
 +    fn checks_readiness_again_after_claiming_the_lock() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        let checks = AtomicUsize::new(0);
 +        run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Automatic,
 +            || checks.fetch_add(1, Ordering::SeqCst) > 0,
 +            || Ok(true),
@@ -3026,6 +3370,7 @@ index 0000000..f73354f
 +
 +    #[test]
 +    fn explicit_retry_of_interrupted_attempt_is_allowed_after_a_new_boot() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        fs::create_dir_all(home.path().join(".sandbox"))?;
 +        let old_boot = current_boot_id()?.wrapping_sub(1);
@@ -3039,6 +3384,7 @@ index 0000000..f73354f
 +        let ready = AtomicBool::new(false);
 +        run_setup_attempt(
 +            home.path(),
++            SandboxScope::Profile,
 +            SetupIntent::Retry,
 +            || ready.load(Ordering::SeqCst),
 +            || Ok(true),
@@ -3052,10 +3398,12 @@ index 0000000..f73354f
 +
 +    #[test]
 +    fn another_installation_never_rotates_existing_global_accounts_automatically() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
 +        let home = tempfile::tempdir()?;
 +        let empty_state = home.path().join("another-home");
 +        let error = run_setup_attempt(
 +            &empty_state,
++            SandboxScope::Profile,
 +            SetupIntent::Automatic,
 +            || false,
 +            || Ok(false),
@@ -3066,7 +3414,207 @@ index 0000000..f73354f
 +        assert!(!empty_state.exists());
 +        Ok(())
 +    }
++
++    /// Runs one attempt whose provisioner reports `outcome`, returning the error text and the
++    /// number of times it provisioned.
++    fn attempt(
++        home: &Path,
++        scope: SandboxScope,
++        intent: SetupIntent,
++        outcome: Result<(), &str>,
++        ready_after_success: &AtomicBool,
++    ) -> (Result<()>, usize) {
++        let calls = AtomicUsize::new(0);
++        let result = run_setup_attempt(
++            home,
++            scope,
++            intent,
++            || ready_after_success.load(Ordering::SeqCst),
++            || Ok(true),
++            || {
++                calls.fetch_add(1, Ordering::SeqCst);
++                match outcome {
++                    Ok(()) => {
++                        ready_after_success.store(true, Ordering::SeqCst);
++                        Ok(())
++                    }
++                    Err(message) => bail!("{message}"),
++                }
++            },
++        );
++        (result, calls.load(Ordering::SeqCst))
++    }
++
++    fn latch(home: &Path, name: &str) -> PathBuf {
++        home.join(".sandbox").join(name)
++    }
++
++    #[test]
++    fn declined_outside_attempt_latches_only_its_own_file() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
++        let home = tempfile::tempdir()?;
++        let ready = AtomicBool::new(false);
++        let (declined, calls) = attempt(
++            home.path(),
++            SandboxScope::External,
++            SetupIntent::Automatic,
++            Err("UAC declined"),
++            &ready,
++        );
++        assert!(declined.is_err());
++        assert_eq!(calls, 1);
++        assert!(latch(home.path(), EXTERNAL_LATCH).exists());
++        assert!(!latch(home.path(), PROFILE_LATCH).exists());
++
++        // The next outside attempt is refused with the folder kind and the retry command.
++        let (refused, calls) = attempt(
++            home.path(),
++            SandboxScope::External,
++            SetupIntent::Automatic,
++            Ok(()),
++            &ready,
++        );
++        let message = refused.unwrap_err().to_string();
++        assert!(message.contains("outside your user folder"));
++        assert!(message.contains("happy-agent sandbox setup --retry"));
++        assert_eq!(calls, 0);
++
++        // A profile workspace's own repair is not blocked by it.
++        let (repaired, calls) = attempt(
++            home.path(),
++            SandboxScope::Profile,
++            SetupIntent::Automatic,
++            Err("repair failed"),
++            &ready,
++        );
++        assert!(repaired.is_err());
++        assert_eq!(calls, 1);
++        assert!(latch(home.path(), PROFILE_LATCH).exists());
++        assert!(latch(home.path(), EXTERNAL_LATCH).exists());
++
++        // Retry asks again, and its success clears both files.
++        let (retried, calls) = attempt(
++            home.path(),
++            SandboxScope::Profile,
++            SetupIntent::Retry,
++            Ok(()),
++            &ready,
++        );
++        retried?;
++        assert_eq!(calls, 1);
++        assert!(!latch(home.path(), PROFILE_LATCH).exists());
++        assert!(!latch(home.path(), EXTERNAL_LATCH).exists());
++        Ok(())
++    }
++
++    #[test]
++    fn a_profile_failure_does_not_block_an_outside_attempt() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
++        let home = tempfile::tempdir()?;
++        let ready = AtomicBool::new(false);
++        let (failed, _) = attempt(
++            home.path(),
++            SandboxScope::Profile,
++            SetupIntent::Automatic,
++            Err("repair failed"),
++            &ready,
++        );
++        assert!(failed.is_err());
++        let (outside, calls) = attempt(
++            home.path(),
++            SandboxScope::External,
++            SetupIntent::Automatic,
++            Ok(()),
++            &ready,
++        );
++        outside?;
++        assert_eq!(calls, 1);
++        assert!(!latch(home.path(), PROFILE_LATCH).exists());
++        Ok(())
++    }
++
++    #[test]
++    fn explicit_setup_is_refused_by_either_latch() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
++        for name in [PROFILE_LATCH, EXTERNAL_LATCH] {
++            let home = tempfile::tempdir()?;
++            fs::create_dir_all(home.path().join(".sandbox"))?;
++            save_attempt(
++                &latch(home.path(), name),
++                &Attempt {
++                    boot_id: current_boot_id()?,
++                    completed_failure: true,
++                },
++            )?;
++            let ready = AtomicBool::new(false);
++            let (refused, calls) = attempt(
++                home.path(),
++                SandboxScope::Profile,
++                SetupIntent::Explicit,
++                Ok(()),
++                &ready,
++            );
++            assert!(refused.unwrap_err().to_string().contains("--retry"));
++            assert_eq!(calls, 0);
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn a_pending_attempt_of_either_scope_blocks_every_intent() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
++        for name in [PROFILE_LATCH, EXTERNAL_LATCH] {
++            for (scope, intent) in [
++                (SandboxScope::Profile, SetupIntent::Automatic),
++                (SandboxScope::External, SetupIntent::Automatic),
++                (SandboxScope::Profile, SetupIntent::Explicit),
++                (SandboxScope::Profile, SetupIntent::Retry),
++            ] {
++                let home = tempfile::tempdir()?;
++                fs::create_dir_all(home.path().join(".sandbox"))?;
++                save_attempt(
++                    &latch(home.path(), name),
++                    &Attempt {
++                        boot_id: current_boot_id()?,
++                        completed_failure: false,
++                    },
++                )?;
++                let ready = AtomicBool::new(false);
++                let (refused, calls) = attempt(home.path(), scope, intent, Ok(()), &ready);
++                assert!(refused.is_err(), "{name} {scope:?} {intent:?}");
++                assert_eq!(calls, 0, "{name} {scope:?} {intent:?}");
++            }
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn a_background_launch_never_provisions() -> Result<()> {
++        let _serial = serialize_setup_request_tests();
++        for (scope, wording) in [
++            (SandboxScope::Profile, "read Git changes here"),
++            (
++                SandboxScope::External,
++                "read Git changes in folders outside your user folder",
++            ),
++        ] {
++            let home = tempfile::tempdir()?;
++            let ready = AtomicBool::new(false);
++            let (refused, calls) =
++                attempt(home.path(), scope, SetupIntent::Background, Ok(()), &ready);
++            let message = refused.unwrap_err().to_string();
++            assert!(message.contains(wording), "{message}");
++            assert!(message.contains("happy-agent sandbox setup"));
++            assert_eq!(calls, 0);
++            assert!(!home.path().join(".sandbox").exists());
++            // A ready installation is unaffected.
++            ready.store(true, Ordering::SeqCst);
++            attempt(home.path(), scope, SetupIntent::Background, Ok(()), &ready).0?;
++        }
++        Ok(())
++    }
 +}
+\ No newline at end of file
 diff --git a/codex-rs/windows-sandbox-rs/src/helper_materialization.rs b/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
 index 7532d19..e32e2d6 100644
 --- a/codex-rs/windows-sandbox-rs/src/helper_materialization.rs
@@ -3191,59 +3739,132 @@ index 7532d19..e32e2d6 100644
      }
  }
 diff --git a/codex-rs/windows-sandbox-rs/src/identity.rs b/codex-rs/windows-sandbox-rs/src/identity.rs
-index 6f3a66d..334d1df 100644
+index 6f3a66d..3eee8f3 100644
 --- a/codex-rs/windows-sandbox-rs/src/identity.rs
 +++ b/codex-rs/windows-sandbox-rs/src/identity.rs
-@@ -3,7 +3,9 @@ use crate::logging::debug_log;
- use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+@@ -4,6 +4,7 @@ use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
  use crate::setup::OFFLINE_USERNAME;
  use crate::setup::ONLINE_USERNAME;
-+use crate::setup::SANDBOX_USERNAMES;
  use crate::setup::SandboxNetworkIdentity;
 +use crate::setup::SandboxScope;
  use crate::setup::SandboxUserRecord;
  use crate::setup::SandboxUsersFile;
  use crate::setup::SetupMarker;
-@@ -73,6 +75,38 @@ pub fn sandbox_setup_is_complete_with_settings(
-         && matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
+@@ -42,23 +43,35 @@ pub struct SandboxCreds {
+     pub password: String,
  }
  
-+/// Read-only readiness for Happy's installation-wide setup gate and status command.
+-/// Returns true when the on-disk setup artifacts exist and match the current
+-/// setup version.
++/// Returns true when the on-disk setup artifacts exist and every scope can use them.
+ ///
+ /// This is a coarse readiness check; `require_logon_sandbox_creds` performs the
+ /// additional runtime validation for offline firewall settings.
+ pub fn sandbox_setup_is_complete(codex_home: &Path) -> bool {
+-    let marker_ok = matches!(load_marker(codex_home), Ok(Some(marker)) if marker.version_matches());
+-    if !marker_ok {
+-        return false;
+-    }
+-    matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
++    SandboxScope::ALL
++        .into_iter()
++        .all(|scope| sandbox_setup_is_complete_for(scope, codex_home))
++}
++
++fn sandbox_setup_is_complete_for(scope: SandboxScope, codex_home: &Path) -> bool {
++    matches!(load_marker(codex_home), Ok(Some(marker)) if marker.supports(scope))
++        && matches!(load_users(codex_home), Ok(Some(users)) if users.supports(scope))
+ }
+ 
+-/// Returns true when setup artifacts and provisioned network settings match.
++/// Returns true when setup artifacts and provisioned network settings match for every scope.
+ pub fn sandbox_setup_is_complete_with_settings(
+     codex_home: &Path,
+     settings: &crate::WindowsSandboxProvisioningSettings,
++) -> bool {
++    SandboxScope::ALL
++        .into_iter()
++        .all(|scope| sandbox_setup_is_complete_with_settings_for(scope, codex_home, settings))
++}
++
++fn sandbox_setup_is_complete_with_settings_for(
++    scope: SandboxScope,
++    codex_home: &Path,
++    settings: &crate::WindowsSandboxProvisioningSettings,
+ ) -> bool {
+     let Ok(Some(mut marker)) = load_marker(codex_home) else {
+         return false;
+@@ -67,12 +80,67 @@ pub fn sandbox_setup_is_complete_with_settings(
+     marker.proxy_ports.sort_unstable();
+     let mut proxy_ports = settings.proxy_ports.clone();
+     proxy_ports.sort_unstable();
+-    marker.version_matches()
++    marker.supports(scope)
+         && marker.proxy_ports == proxy_ports
+         && marker.allow_local_binding == settings.allow_local_binding
+-        && matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
++        && matches!(load_users(codex_home), Ok(Some(users)) if users.supports(scope))
++}
++
++/// Read-only readiness of one scope for Happy's installation-wide setup gate. A scope is ready
++/// when its own records and accounts are, whatever the other scope has.
++pub fn happy_sandbox_setup_is_ready_for(
++    scope: SandboxScope,
++    codex_home: &Path,
++    settings: &crate::WindowsSandboxProvisioningSettings,
++) -> bool {
++    scope_records_are_usable(scope, codex_home, settings)
++        && scope.required_usernames().iter().all(|name| {
++            matches!(local_user_flags(name), Ok(Some(flags)) if flags & UF_ACCOUNTDISABLE == 0)
++        })
+ }
+ 
++/// The scope's setup records exist, match the proxy settings, and yield both identities.
++fn scope_records_are_usable(
++    scope: SandboxScope,
++    codex_home: &Path,
++    settings: &crate::WindowsSandboxProvisioningSettings,
++) -> bool {
++    sandbox_setup_is_complete_with_settings_for(scope, codex_home, settings)
++        && [SandboxNetworkIdentity::Offline, SandboxNetworkIdentity::Online]
++            .into_iter()
++            .all(|identity| matches!(select_identity(identity, scope, codex_home), Ok(Some(_))))
++}
++
++/// Read-only readiness of both scopes, for the status command's full answer.
 +pub fn happy_sandbox_setup_is_ready(
 +    codex_home: &Path,
 +    settings: &crate::WindowsSandboxProvisioningSettings,
 +) -> bool {
-+    sandbox_setup_is_complete_with_settings(codex_home, settings)
-+        && SANDBOX_USERNAMES.iter().all(|name| {
-+            matches!(local_user_flags(name), Ok(Some(flags)) if flags & UF_ACCOUNTDISABLE == 0)
-+        })
-+        && [SandboxScope::Profile, SandboxScope::External].into_iter().all(|scope| {
-+            [SandboxNetworkIdentity::Offline, SandboxNetworkIdentity::Online]
-+                .into_iter()
-+                .all(|identity| matches!(select_identity(identity, scope, codex_home), Ok(Some(_))))
-+        })
++    SandboxScope::ALL
++        .into_iter()
++        .all(|scope| happy_sandbox_setup_is_ready_for(scope, codex_home, settings))
 +}
 +
-+/// True when this installation's own setup record names Happy's accounts but predates the
-+/// current setup version. This installation provisioned those accounts, so automatic setup may
-+/// upgrade them; existing accounts with no record here stay with the installation that made them.
-+/// A newer record is never downgraded.
-+pub(crate) fn happy_sandbox_setup_is_outdated(codex_home: &Path) -> bool {
++/// True when this installation's own setup record names Happy's accounts but cannot serve the
++/// scope, and is not newer than this build. This installation provisioned those accounts, so
++/// automatic setup may upgrade them; existing accounts with no record here stay with the
++/// installation that made them. A newer record is never downgraded.
++pub(crate) fn happy_sandbox_setup_needs_upgrade(scope: SandboxScope, codex_home: &Path) -> bool {
 +    let current = crate::setup::SETUP_VERSION;
-+    matches!(load_marker(codex_home), Ok(Some(marker))
-+        if marker.version < current
-+            && marker.offline_username == OFFLINE_USERNAME
-+            && marker.online_username == ONLINE_USERNAME)
-+        && matches!(load_users(codex_home), Ok(Some(users))
-+            if users.version < current
-+                && users.offline.username == OFFLINE_USERNAME
-+                && users.online.username == ONLINE_USERNAME)
++    let (Ok(Some(marker)), Ok(Some(users))) = (load_marker(codex_home), load_users(codex_home))
++    else {
++        return false;
++    };
++    let own = marker.version <= current
++        && users.version <= current
++        && marker.offline_username == OFFLINE_USERNAME
++        && marker.online_username == ONLINE_USERNAME
++        && users.offline.username == OFFLINE_USERNAME
++        && users.online.username == ONLINE_USERNAME;
++    // The marker knows only the version and the users file knows the external records, so the
++    // scope is served only when both agree.
++    own && !(marker.supports(scope) && users.supports(scope))
 +}
-+
  fn load_marker(codex_home: &Path) -> Result<Option<SetupMarker>> {
      let path = setup_marker_path(codex_home);
      let marker = match fs::read_to_string(&path) {
-@@ -147,6 +181,7 @@ fn decode_password(record: &SandboxUserRecord) -> Result<String> {
+@@ -147,19 +215,25 @@ fn decode_password(record: &SandboxUserRecord) -> Result<String> {
  
  fn select_identity(
      network_identity: SandboxNetworkIdentity,
@@ -3251,8 +3872,13 @@ index 6f3a66d..334d1df 100644
      codex_home: &Path,
  ) -> Result<Option<SandboxIdentity>> {
      let _marker = match load_marker(codex_home)? {
-@@ -157,9 +192,14 @@ fn select_identity(
-         Some(u) if u.version_matches() => u,
+-        Some(m) if m.version_matches() => m,
++        Some(m) if m.supports(scope) => m,
+         _ => return Ok(None),
+     };
+     let users = match load_users(codex_home)? {
+-        Some(u) if u.version_matches() => u,
++        Some(u) if u.supports(scope) => u,
          _ => return Ok(None),
      };
 -    let chosen = match network_identity {
@@ -3269,7 +3895,15 @@ index 6f3a66d..334d1df 100644
      };
      let password = decode_password(&chosen)?;
      Ok(Some(SandboxIdentity {
-@@ -232,6 +272,7 @@ fn require_logon_sandbox_creds_with_setup(
+@@ -216,6 +290,7 @@ fn require_logon_sandbox_creds_with_setup(
+     run_full_setup: impl FnOnce(
+         crate::setup::SandboxSetupRequest<'_>,
+         &crate::setup::OfflineProxySettings,
++        SandboxScope,
+     ) -> Result<()>,
+     run_refresh_setup: impl FnOnce(
+         crate::setup::SandboxSetupRequest<'_>,
+@@ -232,12 +307,14 @@ fn require_logon_sandbox_creds_with_setup(
          .map(<[PathBuf]>::to_vec)
          .unwrap_or_else(|| gather_write_roots_for_permissions(permissions, command_cwd, env_map));
      let network_identity = SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced);
@@ -3277,7 +3911,22 @@ index 6f3a66d..334d1df 100644
      let marker = load_marker(codex_home)?;
      let desired_offline_proxy_settings = desired_offline_proxy_settings(
          marker.as_ref(),
-@@ -252,7 +293,7 @@ fn require_logon_sandbox_creds_with_setup(
+         proxy_settings_mode,
+         env_map,
+         network_identity,
++        scope,
+     );
+     // NOTE: Do not add CODEX_HOME/.sandbox to `needed_write`; it must remain non-writable by the
+     // restricted capability token. The setup helper's `lock_sandbox_dir` is responsible for
+@@ -245,14 +322,14 @@ fn require_logon_sandbox_creds_with_setup(
+     let mut setup_reason: Option<String> = None;
+ 
+     let mut identity = match marker {
+-        Some(marker) if marker.version_matches() => {
++        Some(marker) if marker.supports(scope) => {
+             if let Some(reason) =
+                 marker.request_mismatch_reason(network_identity, &desired_offline_proxy_settings)
+             {
                  setup_reason = Some(reason);
                  None
              } else {
@@ -3286,29 +3935,58 @@ index 6f3a66d..334d1df 100644
                  if selected.is_none() {
                      setup_reason = Some(
                          "sandbox users missing or incompatible with marker version".to_string(),
-@@ -270,7 +311,7 @@ fn require_logon_sandbox_creds_with_setup(
+@@ -269,8 +346,10 @@ fn require_logon_sandbox_creds_with_setup(
+ 
      if identity.is_some() {
          // Cleanup may also have removed the group, so repair missing or disabled accounts before ACL
-         // refresh can fail, not only after a later logon reports ERROR_ACCOUNT_DISABLED.
+-        // refresh can fail, not only after a later logon reports ERROR_ACCOUNT_DISABLED.
 -        for username in [OFFLINE_USERNAME, ONLINE_USERNAME] {
-+        for username in SANDBOX_USERNAMES {
++        // refresh can fail, not only after a later logon reports ERROR_ACCOUNT_DISABLED. Only this
++        // scope's accounts count: an installation without the outside accounts still serves the
++        // profile, and must not be sent through setup by their absence.
++        for username in scope.required_usernames() {
              let needs_repair = match read_local_user_flags(username) {
                  Ok(Some(flags)) => flags & UF_ACCOUNTDISABLE != 0,
                  Ok(None) => true,
-@@ -303,7 +344,7 @@ fn require_logon_sandbox_creds_with_setup(
+@@ -302,8 +381,9 @@ fn require_logon_sandbox_creds_with_setup(
+                 proxy_enforced,
              },
              &desired_offline_proxy_settings,
++            scope,
          )?;
 -        identity = select_identity(network_identity, codex_home)?;
 +        identity = select_identity(network_identity, scope, codex_home)?;
      }
      // Always refresh ACLs (non-elevated) for current roots via the setup binary.
      run_refresh_setup(
-@@ -383,16 +424,133 @@ pub(crate) fn refresh_logon_sandbox_creds(
+@@ -339,10 +419,11 @@ fn desired_offline_proxy_settings(
+     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+     env_map: &HashMap<String, String>,
+     network_identity: SandboxNetworkIdentity,
++    scope: SandboxScope,
+ ) -> crate::setup::OfflineProxySettings {
+     match (marker, proxy_settings_mode) {
+         (Some(marker), crate::WindowsSandboxProxySettingsMode::Preserve)
+-            if marker.version_matches() =>
++            if marker.supports(scope) =>
+         {
+             marker.offline_proxy_settings()
+         }
+@@ -383,16 +464,251 @@ pub(crate) fn refresh_logon_sandbox_creds(
  #[cfg(test)]
  mod tests {
      use super::desired_offline_proxy_settings;
-+    use super::happy_sandbox_setup_is_outdated;
++    use super::happy_sandbox_setup_needs_upgrade;
++    use super::scope_records_are_usable;
++    use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
++    use crate::setup::OFFLINE_EXTERNAL_USERNAME;
++    use crate::setup::ONLINE_EXTERNAL_USERNAME;
++    use crate::setup::SandboxScope;
++    use crate::setup::SETUP_VERSION;
++    use base64::Engine;
++    use codex_protocol::models::PermissionProfile;
++    use std::cell::Cell;
++    use std::path::PathBuf;
      use super::remove_sandbox_users_file;
      use crate::WindowsSandboxProxySettingsMode;
 +    use crate::setup::OFFLINE_USERNAME;
@@ -3357,35 +4035,143 @@ index 6f3a66d..334d1df 100644
 +        }
 +    }
 +
-+    #[test]
-+    fn only_an_older_record_of_happy_accounts_is_outdated() {
-+        let current = crate::setup::SETUP_VERSION;
-+        let outdated = |version: u32, offline: &str, online: &str| {
-+            let codex_home = TempDir::new().expect("tempdir");
-+            write_setup_record(codex_home.path(), version, offline, online);
-+            happy_sandbox_setup_is_outdated(codex_home.path())
-+        };
-+        assert!(outdated(current - 1, OFFLINE_USERNAME, ONLINE_USERNAME));
-+        assert!(!outdated(current, OFFLINE_USERNAME, ONLINE_USERNAME));
-+        // An older build must not downgrade a newer installation.
-+        assert!(!outdated(current + 1, OFFLINE_USERNAME, ONLINE_USERNAME));
-+        assert!(!outdated(current - 1, "CodexSandboxOffline", "CodexSandboxOnline"));
++    fn protected_record(username: &str) -> SandboxUserRecord {
++        SandboxUserRecord {
++            username: username.to_string(),
++            password: base64::engine::general_purpose::STANDARD
++                .encode(crate::dpapi::protect(username.as_bytes()).expect("protect")),
++        }
++    }
 +
-+        // Without this installation's credentials the accounts are not its own to upgrade.
-+        let codex_home = TempDir::new().expect("tempdir");
-+        assert!(!happy_sandbox_setup_is_outdated(codex_home.path()));
-+        write_setup_record(codex_home.path(), current - 1, OFFLINE_USERNAME, ONLINE_USERNAME);
-+        fs::remove_file(sandbox_users_path(codex_home.path())).expect("remove users");
-+        assert!(!happy_sandbox_setup_is_outdated(codex_home.path()));
++    /// Writes a setup record whose passwords decrypt, with or without the external accounts.
++    fn write_usable_records(codex_home: &Path, version: u32, external: bool) {
++        write_setup_record(codex_home, version, OFFLINE_USERNAME, ONLINE_USERNAME);
++        let users = SandboxUsersFile {
++            version,
++            offline: protected_record(OFFLINE_USERNAME),
++            online: protected_record(ONLINE_USERNAME),
++            external_offline: external.then(|| protected_record(OFFLINE_EXTERNAL_USERNAME)),
++            external_online: external.then(|| protected_record(ONLINE_EXTERNAL_USERNAME)),
++        };
++        fs::write(
++            sandbox_users_path(codex_home),
++            serde_json::to_vec(&users).expect("serialize users"),
++        )
++        .expect("write users");
 +    }
 +
 +    #[test]
++    fn only_a_record_that_cannot_serve_the_scope_needs_an_upgrade() {
++        let needs_upgrade = |scope, version: u32, offline: &str, online: &str| {
++            let codex_home = TempDir::new().expect("tempdir");
++            write_setup_record(codex_home.path(), version, offline, online);
++            happy_sandbox_setup_needs_upgrade(scope, codex_home.path())
++        };
++        let names = (OFFLINE_USERNAME, ONLINE_USERNAME);
++        // The profile accounts have not changed since version 9.
++        assert!(needs_upgrade(SandboxScope::Profile, 8, names.0, names.1));
++        assert!(!needs_upgrade(SandboxScope::Profile, 9, names.0, names.1));
++        assert!(!needs_upgrade(SandboxScope::Profile, 10, names.0, names.1));
++        // The outside accounts exist only from version 10, and these records have none.
++        assert!(needs_upgrade(SandboxScope::External, 8, names.0, names.1));
++        assert!(needs_upgrade(SandboxScope::External, 9, names.0, names.1));
++        assert!(needs_upgrade(SandboxScope::External, 10, names.0, names.1));
++        // An older build must not downgrade a newer installation.
++        for scope in SandboxScope::ALL {
++            assert!(!needs_upgrade(scope, 11, names.0, names.1));
++            assert!(!needs_upgrade(scope, 8, "CodexSandboxOffline", "CodexSandboxOnline"));
++        }
++
++        // Without this installation's credentials the accounts are not its own to upgrade.
++        let codex_home = TempDir::new().expect("tempdir");
++        assert!(!happy_sandbox_setup_needs_upgrade(SandboxScope::External, codex_home.path()));
++        write_setup_record(codex_home.path(), 9, OFFLINE_USERNAME, ONLINE_USERNAME);
++        fs::remove_file(sandbox_users_path(codex_home.path())).expect("remove users");
++        assert!(!happy_sandbox_setup_needs_upgrade(SandboxScope::External, codex_home.path()));
++
++        // A complete current installation needs nothing.
++        write_usable_records(codex_home.path(), SETUP_VERSION, true);
++        for scope in SandboxScope::ALL {
++            assert!(!happy_sandbox_setup_needs_upgrade(scope, codex_home.path()));
++        }
++    }
++
++    #[test]
++    fn each_scope_is_ready_on_the_records_it_needs() {
++        let settings = crate::WindowsSandboxProvisioningSettings::default();
++        let usable = |version: u32, external: bool| {
++            let codex_home = TempDir::new().expect("tempdir");
++            write_usable_records(codex_home.path(), version, external);
++            (
++                scope_records_are_usable(SandboxScope::Profile, codex_home.path(), &settings),
++                scope_records_are_usable(SandboxScope::External, codex_home.path(), &settings),
++            )
++        };
++        // Version 9 serves the profile only, as it always did.
++        assert_eq!(usable(9, false), (true, false));
++        assert_eq!(usable(9, true), (true, false));
++        assert_eq!(usable(10, true), (true, true));
++        assert_eq!(usable(10, false), (true, false));
++        assert_eq!(usable(8, false), (false, false));
++        assert_eq!(usable(11, true), (false, false));
++    }
++
++    /// Runs one command's credential lookup against `codex_home` and reports what it asked for.
++    fn require_creds(
++        codex_home: &Path,
++        deny_read: &[PathBuf],
++        full_setups: &Cell<Vec<SandboxScope>>,
++    ) -> anyhow::Result<super::SandboxCreds> {
++        let permissions =
++            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&PermissionProfile::read_only())?;
++        super::require_logon_sandbox_creds_with_setup(
++            &permissions,
++            codex_home,
++            &HashMap::new(),
++            codex_home,
++            Some(&[]),
++            false,
++            Some(&[]),
++            deny_read,
++            &[],
++            false,
++            WindowsSandboxProxySettingsMode::Reconcile,
++            |_request, _settings, scope| {
++                let mut asked = full_setups.take();
++                asked.push(scope);
++                full_setups.set(asked);
++                write_usable_records(codex_home, SETUP_VERSION, true);
++                Ok(())
++            },
++            |_request, _overrides, _settings| Ok(()),
++            // A version 9 installation has no outside accounts.
++            |name| Ok((name != OFFLINE_EXTERNAL_USERNAME && name != ONLINE_EXTERNAL_USERNAME).then_some(0)),
++        )
++    }
++
++    #[test]
++    fn a_profile_command_never_sets_up_the_outside_accounts() {
++        let codex_home = TempDir::new().expect("tempdir");
++        write_usable_records(codex_home.path(), 9, false);
++        let full_setups = Cell::new(Vec::new());
++        let creds = require_creds(codex_home.path(), &[], &full_setups).expect("credentials");
++        assert_eq!(creds.username, OFFLINE_USERNAME);
++        assert_eq!(full_setups.take(), Vec::<SandboxScope>::new());
++    }
++
++    #[test]
++    fn an_outside_command_sets_up_once_then_uses_the_outside_accounts() {
++        let codex_home = TempDir::new().expect("tempdir");
++        write_usable_records(codex_home.path(), 9, false);
++        let profile = crate::happy_setup_gate::windows_profile_directory().expect("profile");
++        let full_setups = Cell::new(Vec::new());
++        let creds = require_creds(codex_home.path(), &[profile], &full_setups).expect("credentials");
++        assert_eq!(creds.username, OFFLINE_EXTERNAL_USERNAME);
++        assert_eq!(full_setups.take(), vec![SandboxScope::External]);
++    }
++    #[test]
 +    fn each_scope_logs_on_with_its_own_accounts() {
 +        use super::select_identity;
-+        use crate::setup::OFFLINE_EXTERNAL_USERNAME;
-+        use crate::setup::ONLINE_EXTERNAL_USERNAME;
-+        use crate::setup::SandboxScope;
-+        use base64::Engine;
 +
 +        let current = crate::setup::SETUP_VERSION;
 +        let codex_home = TempDir::new().expect("tempdir");
@@ -3438,8 +4224,40 @@ index 6f3a66d..334d1df 100644
      #[test]
      fn remove_sandbox_users_file_deletes_existing_file() {
          let codex_home = TempDir::new().expect("tempdir");
+@@ -435,6 +751,7 @@ mod tests {
+                 WindowsSandboxProxySettingsMode::Preserve,
+                 &env_map,
+                 SandboxNetworkIdentity::Offline,
++                SandboxScope::Profile,
+             ),
+             marker.offline_proxy_settings()
+         );
+@@ -444,6 +761,7 @@ mod tests {
+                 WindowsSandboxProxySettingsMode::Reconcile,
+                 &env_map,
+                 SandboxNetworkIdentity::Offline,
++                SandboxScope::Profile,
+             )
+             .proxy_ports,
+             vec![8080]
+@@ -466,6 +784,7 @@ mod tests {
+             WindowsSandboxProxySettingsMode::Reconcile,
+             &env_map,
+             SandboxNetworkIdentity::Offline,
++            SandboxScope::Profile,
+         );
+         assert_eq!(reconciled.proxy_ports, Vec::<u16>::new());
+ 
+@@ -474,6 +793,7 @@ mod tests {
+             WindowsSandboxProxySettingsMode::Preserve,
+             &env_map,
+             SandboxNetworkIdentity::Offline,
++            SandboxScope::Profile,
+         );
+         assert_eq!(desired, marker.offline_proxy_settings());
+         assert_eq!(
 diff --git a/codex-rs/windows-sandbox-rs/src/identity_integration_tests.rs b/codex-rs/windows-sandbox-rs/src/identity_integration_tests.rs
-index 6f1926e..4201c56 100644
+index 6f1926e..94f4bac 100644
 --- a/codex-rs/windows-sandbox-rs/src/identity_integration_tests.rs
 +++ b/codex-rs/windows-sandbox-rs/src/identity_integration_tests.rs
 @@ -62,6 +62,8 @@ fn credential_setup_reconciles_effective_firewall_policy() -> Result<()> {
@@ -3451,8 +4269,18 @@ index 6f1926e..4201c56 100644
          };
          let marker_bytes = serde_json::to_vec(&marker)?;
          for (path, bytes) in [
+@@ -90,7 +92,8 @@ fn credential_setup_reconciles_effective_firewall_policy() -> Result<()> {
+             &[],
+             /*proxy_enforced*/ true,
+             WindowsSandboxProxySettingsMode::Reconcile,
+-            |_, _| {
++            |_, _, scope| {
++                assert_eq!(scope, crate::setup::SandboxScope::Profile);
+                 launches.borrow_mut().push(SetupLaunch::Full);
+                 Err(anyhow::anyhow!("full setup intercepted"))
+             },
 diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
-index e83a42a..c1412d8 100644
+index e83a42a..f4ed6b5 100644
 --- a/codex-rs/windows-sandbox-rs/src/lib.rs
 +++ b/codex-rs/windows-sandbox-rs/src/lib.rs
 @@ -79,6 +79,8 @@ mod hide_users;
@@ -3464,18 +4292,20 @@ index e83a42a..c1412d8 100644
  mod logging;
  #[cfg(target_os = "windows")]
  mod no_reparse_dir;
-@@ -227,6 +229,10 @@ pub use identity::require_logon_sandbox_creds;
+@@ -227,6 +229,12 @@ pub use identity::require_logon_sandbox_creds;
  #[cfg(target_os = "windows")]
  pub use identity::sandbox_setup_is_complete;
  #[cfg(target_os = "windows")]
 +pub use identity::happy_sandbox_setup_is_ready;
++#[cfg(target_os = "windows")]
++pub use identity::happy_sandbox_setup_is_ready_for;
 +#[cfg(target_os = "windows")]
 +pub use happy_setup_gate::default_state_directory as happy_default_state_directory;
 +#[cfg(target_os = "windows")]
  pub use identity::sandbox_setup_is_complete_with_settings;
  #[cfg(target_os = "windows")]
  pub use ipc_framed::ErrorPayload;
-@@ -259,6 +265,16 @@ pub use ipc_framed::read_frame;
+@@ -259,6 +267,16 @@ pub use ipc_framed::read_frame;
  #[cfg(target_os = "windows")]
  pub use ipc_framed::write_frame;
  #[cfg(target_os = "windows")]
@@ -3492,7 +4322,7 @@ index e83a42a..c1412d8 100644
  pub use logging::current_log_file_path;
  #[cfg(target_os = "windows")]
  pub use logging::current_log_file_path_for_codex_home;
-@@ -323,10 +339,16 @@ pub use resolved_permissions::WindowsSandboxTokenMode;
+@@ -323,10 +341,16 @@ pub use resolved_permissions::WindowsSandboxTokenMode;
  #[cfg(target_os = "windows")]
  pub use resolved_permissions::token_mode_for_permission_profile;
  #[cfg(target_os = "windows")]
@@ -3509,7 +4339,7 @@ index e83a42a..c1412d8 100644
  pub use setup::SETUP_VERSION;
  #[cfg(target_os = "windows")]
  pub use setup::SandboxSetupRequest;
-@@ -339,6 +361,8 @@ pub use setup::run_elevated_provisioning_setup_with_retained_handles;
+@@ -339,6 +363,8 @@ pub use setup::run_elevated_provisioning_setup_with_retained_handles;
  #[cfg(target_os = "windows")]
  pub use setup::run_elevated_setup;
  #[cfg(target_os = "windows")]
@@ -3518,7 +4348,7 @@ index e83a42a..c1412d8 100644
  pub use setup::run_setup_refresh;
  #[cfg(target_os = "windows")]
  pub use setup::run_setup_refresh_with_extra_read_roots;
-@@ -392,11 +416,17 @@ pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_prof
+@@ -392,11 +418,17 @@ pub use unified_exec::spawn_windows_sandbox_session_elevated_for_permission_prof
  #[cfg(target_os = "windows")]
  pub use unified_exec::spawn_windows_sandbox_session_for_level;
  #[cfg(target_os = "windows")]
@@ -3537,7 +4367,7 @@ index e83a42a..c1412d8 100644
  #[cfg(target_os = "windows")]
  pub use wfp_setup::install_wfp_filters;
  #[cfg(target_os = "windows")]
-@@ -408,8 +438,12 @@ pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
+@@ -408,8 +440,12 @@ pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
  #[cfg(target_os = "windows")]
  pub use windows_impl::run_windows_sandbox_legacy_preflight;
  #[cfg(target_os = "windows")]
@@ -3651,7 +4481,7 @@ index f2524fa..4365444 100644
  /// Versioned provisioning-service message carried in a length-prefixed JSON frame.
  #[derive(Debug, Serialize, Deserialize, Clone)]
 diff --git a/codex-rs/windows-sandbox-rs/src/setup.rs b/codex-rs/windows-sandbox-rs/src/setup.rs
-index 1e84b6f..2eb2e0f 100644
+index 1e84b6f..f801c3e 100644
 --- a/codex-rs/windows-sandbox-rs/src/setup.rs
 +++ b/codex-rs/windows-sandbox-rs/src/setup.rs
 @@ -33,6 +33,8 @@ use crate::setup_error::extract_failure;
@@ -3663,7 +4493,7 @@ index 1e84b6f..2eb2e0f 100644
  use anyhow::Result;
  use anyhow::anyhow;
  use base64::Engine;
-@@ -47,13 +49,75 @@ use windows_sys::Win32::Security::CheckTokenMembership;
+@@ -47,13 +49,97 @@ use windows_sys::Win32::Security::CheckTokenMembership;
  use windows_sys::Win32::Security::FreeSid;
  use windows_sys::Win32::Security::SECURITY_NT_AUTHORITY;
  
@@ -3672,8 +4502,10 @@ index 1e84b6f..2eb2e0f 100644
 -pub const ONLINE_USERNAME: &str = "CodexSandboxOnline";
 +// Happy setup revisions: 8 repaired ACL ownership from the initial Windows prototype;
 +// 9 replaces the account-wide bind blocks with listen and inbound blocks; 10 adds the accounts
-+// for workspaces outside the user profile.
++// for workspaces outside the user profile. A version 9 installation keeps serving the profile
++// accounts as it did; only the outside accounts need version 10.
 +pub const SETUP_VERSION: u32 = 10;
++const PROFILE_MIN_SETUP_VERSION: u32 = 9;
 +pub const OFFLINE_USERNAME: &str = "HappySandboxOffline";
 +pub const ONLINE_USERNAME: &str = "HappySandboxOnline";
 +// Windows limits local account names to 20 characters.
@@ -3725,6 +4557,26 @@ index 1e84b6f..2eb2e0f 100644
 +            Self::External => (OFFLINE_EXTERNAL_USERNAME, ONLINE_EXTERNAL_USERNAME),
 +        }
 +    }
++
++    pub(crate) const ALL: [Self; 2] = [Self::Profile, Self::External];
++
++    /// Whether a setup record of this version serves the scope. The profile accounts are
++    /// unchanged since version 9; the external accounts exist only from version 10.
++    pub(crate) fn supports_version(self, version: u32) -> bool {
++        match self {
++            Self::Profile => (PROFILE_MIN_SETUP_VERSION..=SETUP_VERSION).contains(&version),
++            Self::External => version == SETUP_VERSION,
++        }
++    }
++
++    /// Every account that must exist and be enabled for the scope to work. The external accounts
++    /// are also members of the shared group, so an external command needs all four.
++    pub(crate) fn required_usernames(self) -> &'static [&'static str] {
++        match self {
++            Self::Profile => &SANDBOX_USERNAMES[..2],
++            Self::External => &SANDBOX_USERNAMES,
++        }
++    }
 +}
 +
 +fn path_contains(root: &Path, path: &Path) -> bool {
@@ -3743,7 +4595,7 @@ index 1e84b6f..2eb2e0f 100644
  const USERPROFILE_ROOT_EXCLUSIONS: &[&str] = &[
      ".ssh",
      ".tsh",
-@@ -332,6 +396,7 @@ fn run_setup_refresh_inner(
+@@ -332,6 +418,7 @@ fn run_setup_refresh_inner(
          .validate_elevated_filesystem_policy(request.command_cwd)?;
      let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
      let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
@@ -3751,7 +4603,7 @@ index 1e84b6f..2eb2e0f 100644
      let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
      let offline_proxy_settings =
          offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
-@@ -348,9 +413,10 @@ fn run_setup_refresh_inner(
+@@ -348,9 +435,10 @@ fn run_setup_refresh_inner(
          proxy_ports: offline_proxy_settings.proxy_ports,
          allow_local_binding: offline_proxy_settings.allow_local_binding,
          otel: None,
@@ -3763,7 +4615,7 @@ index 1e84b6f..2eb2e0f 100644
      };
      let json = serde_json::to_vec(&payload)?;
      let b64 = BASE64_STANDARD.encode(json);
-@@ -389,7 +455,7 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+@@ -389,7 +477,7 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
          ),
          Some(&sbx_dir),
      );
@@ -3772,7 +4624,7 @@ index 1e84b6f..2eb2e0f 100644
          let message = format!(
              "setup refresh failed to launch helper: helper={}, cwd={}, log={}, error={err}",
              exe.display(),
-@@ -419,6 +485,135 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
+@@ -419,6 +507,135 @@ fn run_setup_refresh_payload(b64: &str, codex_home: &Path) -> Result<()> {
      Ok(())
  }
  
@@ -3908,7 +4760,18 @@ index 1e84b6f..2eb2e0f 100644
  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
  pub struct SetupMarker {
      pub version: u32,
-@@ -481,6 +676,11 @@ pub struct SandboxUsersFile {
+@@ -433,8 +650,8 @@ pub struct SetupMarker {
+ }
+ 
+ impl SetupMarker {
+-    pub fn version_matches(&self) -> bool {
+-        self.version == SETUP_VERSION
++    pub fn supports(&self, scope: SandboxScope) -> bool {
++        scope.supports_version(self.version)
+     }
+ 
+     pub(crate) fn offline_proxy_settings(&self) -> OfflineProxySettings {
+@@ -481,11 +698,19 @@ pub struct SandboxUsersFile {
      pub version: u32,
      pub offline: SandboxUserRecord,
      pub online: SandboxUserRecord,
@@ -3920,7 +4783,17 @@ index 1e84b6f..2eb2e0f 100644
  }
  
  impl SandboxUsersFile {
-@@ -692,6 +892,8 @@ struct ElevationPayload {
+-    pub fn version_matches(&self) -> bool {
+-        self.version == SETUP_VERSION
++    /// External accounts also need their own records; the shared records never stand in for them.
++    pub fn supports(&self, scope: SandboxScope) -> bool {
++        scope.supports_version(self.version)
++            && (scope == SandboxScope::Profile
++                || (self.external_offline.is_some() && self.external_online.is_some()))
+     }
+ }
+ 
+@@ -692,6 +917,8 @@ struct ElevationPayload {
      mode: SetupMode,
      #[serde(default)]
      refresh_only: bool,
@@ -3929,7 +4802,7 @@ index 1e84b6f..2eb2e0f 100644
  }
  
  #[derive(Clone, Copy, Serialize)]
-@@ -949,20 +1151,19 @@ fn run_setup_exe_payload(
+@@ -949,20 +1176,19 @@ fn run_setup_exe_payload(
      };
  
      if !needs_elevation {
@@ -3952,7 +4825,7 @@ index 1e84b6f..2eb2e0f 100644
          }
          .map_err(|err| {
              failure(
-@@ -970,6 +1171,7 @@ fn run_setup_exe_payload(
+@@ -970,6 +1196,7 @@ fn run_setup_exe_payload(
                  format!("failed to launch setup helper (non-elevated): {err}"),
              )
          })?;
@@ -3960,7 +4833,7 @@ index 1e84b6f..2eb2e0f 100644
          if !status.success() {
              return Err(report_helper_failure(
                  codex_home,
-@@ -1004,7 +1206,7 @@ fn run_setup_exe_payload(
+@@ -1004,7 +1231,7 @@ fn run_setup_exe_payload(
      // Hide the window for the elevated helper.
      sei.nShow = 0; // SW_HIDE
      let ok = unsafe { ShellExecuteExW(&mut sei) };
@@ -3969,7 +4842,7 @@ index 1e84b6f..2eb2e0f 100644
          let last_error = unsafe { GetLastError() };
          let code = if last_error == ERROR_CANCELLED {
              SetupErrorCode::OrchestratorHelperLaunchCanceled
-@@ -1016,8 +1218,15 @@ fn run_setup_exe_payload(
+@@ -1016,8 +1243,15 @@ fn run_setup_exe_payload(
              format!("ShellExecuteExW failed to launch setup helper: {last_error}"),
          ));
      }
@@ -3986,31 +4859,67 @@ index 1e84b6f..2eb2e0f 100644
          let mut code: u32 = 1;
          GetExitCodeProcess(sei.hProcess, &mut code);
          CloseHandle(sei.hProcess);
-@@ -1040,48 +1249,83 @@ fn run_setup_exe_payload(
+@@ -1040,48 +1274,127 @@ fn run_setup_exe_payload(
  }
  
  pub fn run_elevated_setup(request: SandboxSetupRequest<'_>) -> Result<()> {
 -    run_elevated_setup_inner(request, /*offline_proxy_settings_override*/ None)
-+    run_elevated_setup_inner(request, /*offline_proxy_settings_override*/ None, None)
++    run_elevated_setup_inner(
++        request,
++        /*offline_proxy_settings_override*/ None,
++        None,
++        SandboxScope::Profile,
++    )
  }
  
  pub(crate) fn run_elevated_setup_with_proxy_settings(
      request: SandboxSetupRequest<'_>,
      offline_proxy_settings: &OfflineProxySettings,
++    scope: SandboxScope,
  ) -> Result<()> {
 -    run_elevated_setup_inner(request, Some(offline_proxy_settings))
-+    run_elevated_setup_inner(request, Some(offline_proxy_settings), None)
++    run_elevated_setup_inner(request, Some(offline_proxy_settings), None, scope)
 +}
 +
 +/// Explicit user-requested setup, including a deliberate retry after cancellation/failure.
++/// It provisions every scope's accounts, so it is not tied to either scope.
 +pub fn run_happy_explicit_setup(request: SandboxSetupRequest<'_>, retry: bool) -> Result<()> {
-+    run_elevated_setup_inner(request, None, Some(if retry { SetupIntent::Retry } else { SetupIntent::Explicit }))
++    run_elevated_setup_inner(
++        request,
++        None,
++        Some(if retry { SetupIntent::Retry } else { SetupIntent::Explicit }),
++        SandboxScope::Profile,
++    )
++}
++
++/// Why a launch may or may not open the administrator prompt, from its own flags and
++/// environment. A background launch must never prompt: a restart would otherwise open a prompt
++/// that nobody asked for.
++fn setup_intent(
++    env_map: &HashMap<String, String>,
++    process_no_provision: bool,
++    explicit_intent: Option<SetupIntent>,
++) -> SetupIntent {
++    let enabled = |name: &str| env_map.get(name).is_some_and(|value| value == "1");
++    if enabled("HAPPY_WINDOWS_SANDBOX_NO_PROVISION") || process_no_provision {
++        return SetupIntent::Disabled;
++    }
++    explicit_intent.unwrap_or_else(|| {
++        if !enabled("HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP") {
++            SetupIntent::Disabled
++        } else if enabled("HAPPY_WINDOWS_SANDBOX_BACKGROUND") {
++            SetupIntent::Background
++        } else {
++            SetupIntent::Automatic
++        }
++    })
  }
  
  fn run_elevated_setup_inner(
      request: SandboxSetupRequest<'_>,
      offline_proxy_settings_override: Option<&OfflineProxySettings>,
 +    explicit_intent: Option<SetupIntent>,
++    scope: SandboxScope,
  ) -> Result<()> {
 -    request
 -        .permissions
@@ -4025,18 +4934,9 @@ index 1e84b6f..2eb2e0f 100644
 -    })?;
 -    let payload = elevated_provisioning_payload(&request, offline_proxy_settings_override);
 +    request.permissions.validate_elevated_filesystem_policy(request.command_cwd)?;
-+    let intent = if request.env_map.get("HAPPY_WINDOWS_SANDBOX_NO_PROVISION").is_some_and(|value| value == "1")
-+        || std::env::var("HAPPY_WINDOWS_SANDBOX_NO_PROVISION").is_ok_and(|value| value == "1") {
-+        SetupIntent::Disabled
-+    } else {
-+        explicit_intent.unwrap_or_else(|| {
-+            if request.env_map.get("HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP").is_some_and(|value| value == "1") {
-+                SetupIntent::Automatic
-+            } else {
-+                SetupIntent::Disabled
-+            }
-+        })
-+    };
++    let process_no_provision =
++        std::env::var("HAPPY_WINDOWS_SANDBOX_NO_PROVISION").is_ok_and(|value| value == "1");
++    let intent = setup_intent(request.env_map, process_no_provision, explicit_intent);
 +    let settings = offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
 +    let settings = crate::WindowsSandboxProvisioningSettings {
 +        proxy_ports: settings.proxy_ports,
@@ -4051,13 +4951,30 @@ index 1e84b6f..2eb2e0f 100644
      })?;
 -    run_setup_exe(&payload, needs_elevation, request.codex_home, &[])
 +    let coordination_home = crate::happy_setup_gate::default_state_directory()?;
++    // A command needs only its own scope to be ready. Explicit setup provisions all four
++    // accounts, so it is finished only when both scopes are.
++    let scopes: &[SandboxScope] = match intent {
++        SetupIntent::Explicit | SetupIntent::Retry => &SandboxScope::ALL,
++        SetupIntent::Automatic | SetupIntent::Background | SetupIntent::Disabled => {
++            std::slice::from_ref(&scope)
++        }
++    };
 +    run_setup_attempt(
 +        &coordination_home,
++        scope,
 +        intent,
-+        || crate::identity::happy_sandbox_setup_is_ready(request.codex_home, &settings),
++        || {
++            scopes.iter().all(|scope| {
++                crate::identity::happy_sandbox_setup_is_ready_for(
++                    *scope,
++                    request.codex_home,
++                    &settings,
++                )
++            })
++        },
 +        // Automatic setup may create the global accounts, or upgrade the ones this installation
 +        // already provisioned. Accounts another installation provisioned need explicit setup.
-+        || Ok(crate::identity::happy_sandbox_setup_is_outdated(request.codex_home)
++        || Ok(crate::identity::happy_sandbox_setup_needs_upgrade(scope, request.codex_home)
 +            || (crate::winutil::local_user_flags(OFFLINE_USERNAME)?.is_none() && crate::winutil::local_user_flags(ONLINE_USERNAME)?.is_none())),
 +        || run_setup_exe(&payload, needs_elevation, request.codex_home, &[]),
 +    )
@@ -4087,7 +5004,7 @@ index 1e84b6f..2eb2e0f 100644
          version: SETUP_VERSION,
          offline_username: OFFLINE_USERNAME.to_string(),
          online_username: ONLINE_USERNAME.to_string(),
-@@ -1093,11 +1337,12 @@ fn elevated_provisioning_payload(
+@@ -1093,11 +1406,12 @@ fn elevated_provisioning_payload(
          deny_write_paths: Vec::new(),
          proxy_ports: offline_proxy_settings.proxy_ports,
          allow_local_binding: offline_proxy_settings.allow_local_binding,
@@ -4102,7 +5019,7 @@ index 1e84b6f..2eb2e0f 100644
  }
  
  pub fn run_elevated_provisioning_setup(
-@@ -1168,6 +1413,7 @@ pub fn run_elevated_provisioning_setup_with_retained_handles(
+@@ -1168,6 +1482,7 @@ pub fn run_elevated_provisioning_setup_with_retained_handles(
          real_user: real_user.to_string(),
          mode: SetupMode::ProvisionOnly,
          refresh_only: false,
@@ -4110,13 +5027,82 @@ index 1e84b6f..2eb2e0f 100644
      };
      run_setup_exe(
          &payload,
-@@ -1385,7 +1631,41 @@ fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> V
+@@ -1385,7 +1700,110 @@ fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> V
  
  #[cfg(test)]
  mod tests {
 +    use super::SandboxScope;
      use super::WINDOWS_PLATFORM_DEFAULT_READ_ROOTS;
 +    use super::path_contains;
++    use super::setup_intent;
++    use crate::happy_setup_gate::SetupIntent;
++
++    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
++        pairs
++            .iter()
++            .map(|(name, value)| (name.to_string(), value.to_string()))
++            .collect()
++    }
++
++    #[test]
++    fn only_a_launch_somebody_waits_on_may_open_the_prompt() {
++        let allowed = [("HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP", "1")];
++        let background = [
++            ("HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP", "1"),
++            ("HAPPY_WINDOWS_SANDBOX_BACKGROUND", "1"),
++        ];
++        assert_eq!(setup_intent(&env(&allowed), false, None), SetupIntent::Automatic);
++        assert_eq!(setup_intent(&env(&background), false, None), SetupIntent::Background);
++        // An explicit state directory or disabled provisioning is reported as itself.
++        assert_eq!(setup_intent(&env(&[]), false, None), SetupIntent::Disabled);
++        assert_eq!(
++            setup_intent(&env(&[("HAPPY_WINDOWS_SANDBOX_BACKGROUND", "1")]), false, None),
++            SetupIntent::Disabled
++        );
++        assert_eq!(setup_intent(&env(&background), true, None), SetupIntent::Disabled);
++        // The user's own setup command is never a background launch.
++        assert_eq!(
++            setup_intent(&env(&background), false, Some(SetupIntent::Explicit)),
++            SetupIntent::Explicit
++        );
++    }
++
++    #[test]
++    fn records_serve_only_the_scopes_their_version_and_accounts_allow() {
++        use super::SandboxUserRecord;
++        use super::SandboxUsersFile;
++        use super::SetupMarker;
++        let record = |username: &str| SandboxUserRecord {
++            username: username.to_string(),
++            password: String::new(),
++        };
++        let marker = |version| SetupMarker {
++            version,
++            offline_username: "offline".to_string(),
++            online_username: "online".to_string(),
++            created_at: None,
++            proxy_ports: Vec::new(),
++            allow_local_binding: false,
++        };
++        let users = |version, external: bool| SandboxUsersFile {
++            version,
++            offline: record("offline"),
++            online: record("online"),
++            external_offline: external.then(|| record("offline-x")),
++            external_online: external.then(|| record("online-x")),
++        };
++        let serves = |version, external| {
++            [SandboxScope::Profile, SandboxScope::External].map(|scope| {
++                (marker(version).supports(scope), users(version, external).supports(scope))
++            })
++        };
++        assert_eq!(serves(9, false), [(true, true), (false, false)]);
++        assert_eq!(serves(10, true), [(true, true), (true, true)]);
++        // The shared records never stand in for the outside accounts.
++        assert_eq!(serves(10, false), [(true, true), (true, false)]);
++        assert_eq!(serves(8, true), [(false, false), (false, false)]);
++        assert_eq!(serves(11, true), [(false, false), (false, false)]);
++    }
 +
 +    #[test]
 +    fn scope_is_external_only_when_the_profile_itself_is_denied() {
@@ -4152,7 +5138,7 @@ index 1e84b6f..2eb2e0f 100644
      use super::WINDOWS_SANDBOX_PROXY_PORTS_ENV_KEY;
      use super::build_payload_roots;
      use super::find_setup_exe_for_current_exe;
-@@ -1600,7 +1880,7 @@ mod tests {
+@@ -1600,7 +2018,7 @@ mod tests {
  
          let payload = super::elevated_provisioning_payload(
              &request, /*offline_proxy_settings_override*/ None,
@@ -4161,7 +5147,7 @@ index 1e84b6f..2eb2e0f 100644
  
          assert_eq!(payload.command_cwd, codex_home);
          assert_eq!(payload.read_roots, Vec::<PathBuf>::new());
-@@ -1870,7 +2150,7 @@ mod tests {
+@@ -1870,7 +2288,7 @@ mod tests {
          fs::create_dir_all(&bin_dir).expect("create bin dir");
          fs::create_dir_all(&resources_dir).expect("create resources dir");
          let exe = bin_dir.join("codex.exe");

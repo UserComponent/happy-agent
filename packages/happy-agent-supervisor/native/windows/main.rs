@@ -11,8 +11,31 @@ use std::{collections::HashMap, io::{BufRead, Write}, path::PathBuf, sync::{mpsc
 use codex_windows_sandbox::happy_default_state_directory as default_state_directory;
 
 fn setup_status(state: &std::path::Path) -> serde_json::Value {
-    let ready = codex_windows_sandbox::happy_sandbox_setup_is_ready(state, &codex_windows_sandbox::WindowsSandboxProvisioningSettings::default());
-    json!({"ready": ready, "stateDirectory": state, "setupVersion": codex_windows_sandbox::SETUP_VERSION})
+    let settings = codex_windows_sandbox::WindowsSandboxProvisioningSettings::default();
+    // `ready` is what a workspace inside the user folder needs, which every released install has.
+    // `externalReady` is what a workspace outside it needs, which asks for approval on first use.
+    let ready = codex_windows_sandbox::happy_sandbox_setup_is_ready_for(codex_windows_sandbox::SandboxScope::Profile, state, &settings);
+    let external_ready = codex_windows_sandbox::happy_sandbox_setup_is_ready_for(codex_windows_sandbox::SandboxScope::External, state, &settings);
+    json!({"ready": ready, "externalReady": external_ready, "stateDirectory": state, "setupVersion": codex_windows_sandbox::SETUP_VERSION})
+}
+
+/// The setup-related environment of one launch, from its own flags. Inherited values never decide
+/// it: only the real per-user state may trigger one automatic first-time installation, and only a
+/// launch somebody is waiting on may open the administrator prompt for it.
+fn launch_environment(mut env: HashMap<String,String>, no_provision: bool, explicit_state: bool, background: bool) -> HashMap<String,String> {
+    if no_provision {env.insert("HAPPY_WINDOWS_SANDBOX_NO_PROVISION".into(),"1".into());}
+    // An explicit development state must already exist or be deliberately set up through CLI.
+    env.insert("HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP".into(), if explicit_state {"0"} else {"1"}.into());
+    // A Git scan runs on every daemon start. If it could open the prompt, a restart would show one
+    // with nothing on screen to explain it, so it fails instead and the user sets up deliberately.
+    env.remove("HAPPY_WINDOWS_SANDBOX_BACKGROUND");
+    if background {env.insert("HAPPY_WINDOWS_SANDBOX_BACKGROUND".into(),"1".into());}
+    env
+}
+
+/// A worker is always a background launch; any other launch is one only when it says so.
+fn is_background_launch(worker: bool, background_flag: bool) -> bool {
+    worker || background_flag
 }
 
 #[derive(Deserialize)]
@@ -310,6 +333,7 @@ async fn run() -> Result<i32> {
     let mut retry=false;
     let mut no_provision=false;
     let mut worker=false;
+    let mut background=false;
     let mut shell_runner=false;
     let mut command=Vec::new();
     while let Some(arg)=args.next() {
@@ -323,6 +347,7 @@ async fn run() -> Result<i32> {
             "--retry" => retry=true,
             "--no-provision" => no_provision=true,
             "--worker" => worker=true,
+            "--background" => background=true,
             "--shell-runner" => shell_runner=true,
             "--" => {command.extend(args);break;},
             _ => bail!("unknown supervisor argument: {arg}"),
@@ -332,7 +357,7 @@ async fn run() -> Result<i32> {
     let state=match state {Some(path)=>path,None=>default_state_directory()?};
     if !state.is_absolute() {bail!("state must be absolute")}
     if setup || status {
-        if setup && status || retry && !setup || policy.is_some() || !command.is_empty() || tty || worker || shell_runner {bail!("setup/status must not include a command or policy")}
+        if setup && status || retry && !setup || policy.is_some() || !command.is_empty() || tty || worker || background || shell_runner {bail!("setup/status must not include a command or policy")}
         if setup {
             let permissions=codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile(&PermissionProfile::read_only())?;
             let mut env:HashMap<String,String>=std::env::vars().collect();
@@ -405,11 +430,7 @@ async fn run() -> Result<i32> {
         .map(AbsolutePathBuf::try_from).collect::<Result<Vec<_>,_>>()?;
     let profile:PermissionProfile=serde_json::from_value(json!({"type":"managed","file_system":{"type":"restricted","entries":entries},"network":if p.network.egress {"enabled"} else {"restricted"}}))?;
     let roots=vec![AbsolutePathBuf::try_from(cwd.clone())?];
-    let mut env:HashMap<String,String>=std::env::vars().collect();
-    if no_provision {env.insert("HAPPY_WINDOWS_SANDBOX_NO_PROVISION".into(),"1".into());}
-    // Only the real per-user default may trigger one automatic first-time installation.
-    // An explicit development state must already exist or be deliberately set up through CLI.
-    env.insert("HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP".into(), if explicit_state {"0"} else {"1"}.into());
+    let mut env=launch_environment(std::env::vars().collect(), no_provision, explicit_state, is_background_launch(worker, background));
     for key in ["TEMP", "TMP", "TMPDIR"] {
         env.insert(key.into(), temporary_path.to_string_lossy().into_owned());
     }
@@ -514,4 +535,40 @@ fn main() {
         Err(error) => Err(anyhow::Error::new(error).context("create runtime")),
     };
     match outcome {Ok(code)=>std::process::exit(code),Err(err)=>{eprintln!("Happy Windows sandbox: {err:#}");std::process::exit(125)}}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launch(worker: bool, background_flag: bool) -> HashMap<String,String> {
+        launch_environment(HashMap::new(), false, false, is_background_launch(worker, background_flag))
+    }
+
+    fn background(env: &HashMap<String,String>) -> Option<&str> {
+        env.get("HAPPY_WINDOWS_SANDBOX_BACKGROUND").map(String::as_str)
+    }
+
+    #[test]
+    fn workers_and_flagged_launches_are_background_launches() {
+        assert_eq!(background(&launch(true, false)), Some("1"));
+        assert_eq!(background(&launch(false, true)), Some("1"));
+        // A shell runner serves a person's command, so it may open the prompt.
+        assert_eq!(background(&launch(false, false)), None);
+    }
+
+    #[test]
+    fn an_inherited_background_marker_does_not_make_a_launch_background() {
+        let inherited = HashMap::from([("HAPPY_WINDOWS_SANDBOX_BACKGROUND".to_string(), "1".to_string())]);
+        let env = launch_environment(inherited, false, false, false);
+        assert!(!env.contains_key("HAPPY_WINDOWS_SANDBOX_BACKGROUND"));
+    }
+
+    #[test]
+    fn automatic_setup_is_allowed_only_for_the_default_state() {
+        let allowed = |explicit_state| launch_environment(HashMap::new(), false, explicit_state, false)["HAPPY_WINDOWS_SANDBOX_ALLOW_AUTO_SETUP"].clone();
+        assert_eq!(allowed(false), "1");
+        assert_eq!(allowed(true), "0");
+        assert_eq!(launch_environment(HashMap::new(), true, false, false).get("HAPPY_WINDOWS_SANDBOX_NO_PROVISION").map(String::as_str), Some("1"));
+    }
 }
