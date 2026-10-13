@@ -128,3 +128,14 @@ verify ordinary events, ignored directories, unsubscribe, and callback garbage c
 Parcel reports canonical event paths. Each subscription resolves its native root and uses that
 same root for ignore paths and relative event names, so a caller's symlink alias cannot hide
 changes. Missing roots keep the original path and the ordinary subscription retry behavior.
+
+## A branch picker lists refs once, not per keystroke
+
+The comparison-branch picker asks for matching branches as a person types. Each listing is one
+read-only `for-each-ref` over `refs/heads` and `refs/remotes`, already sorted newest first and
+capped at 2 MiB, through the same scan sandbox as the Git state; it never fetches. The parsed list
+answers every query for that folder for five seconds, so a burst of typing filters in memory
+instead of starting a Git process per keystroke. It lists every remote's branches rather than only
+the compared remote's, because any `<remote>/<branch>` resolves as a comparison base and finding
+the primary remote would cost a second process. It leaves the checked-out branch out, because a
+branch compared with itself measures nothing, and touches no tracker, snapshot, or event.

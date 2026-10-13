@@ -6150,6 +6150,25 @@ export class ApiModule implements AgentModule {
             sendJson(response, 200, { git: this.#git.resource(snapshot) });
             return true;
         }
+        const branches = /^\/v0\/workspaces\/([a-z][a-z0-9]*)\/git\/branches$/.exec(url.pathname);
+        if (branches !== null && request.method === "GET") {
+            assertOnlyQueryParameters(url, ["limit", "query"]);
+            const query = url.searchParams.get("query") ?? "";
+            if (query.length > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(query)) {
+                throw invalidRequest("The branch query must be at most 200 printable characters.");
+            }
+            const limit = integerParameter(url.searchParams.get("limit"), 50, 1, 200);
+            const scope = await this.#resolveWorkspaceScope(ctx, branches[1] as string);
+            // Like its Git state, a folder's branches are read only on this machine.
+            if (scope.runnerId !== undefined) {
+                throw notFound("Git state is not tracked on runners.");
+            }
+            const list = await this.#git.branches(scope.root, { limit, query });
+            if (list === undefined)
+                throw notFound("This workspace's folder is not a Git repository.");
+            sendJson(response, 200, list);
+            return true;
+        }
         return false;
     }
 
