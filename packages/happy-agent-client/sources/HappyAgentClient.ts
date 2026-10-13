@@ -141,7 +141,13 @@ import type {
     WriteFileRequest,
     WriteFileResponse,
 } from "./protocol/files.js";
-import type { GitStateResponse, WatchGitRequest, WatchGitResponse } from "./protocol/git.js";
+import type {
+    GitStateResponse,
+    ListWorkspaceBranchesQuery,
+    ListWorkspaceBranchesResponse,
+    WatchGitRequest,
+    WatchGitResponse,
+} from "./protocol/git.js";
 import type { HappyIntegrationResponse } from "./protocol/integrations.js";
 import type {
     CloseLiveSessionRequest,
@@ -2163,6 +2169,23 @@ export class HappyAgentClient {
         return await this.#json({
             method: "GET",
             path: `v0/workspaces/${encodeURIComponent(workspaceId)}/git`,
+            signal: options.signal,
+        });
+    }
+
+    /**
+     * `GET /v0/workspaces/:workspaceId/git/branches` — the branches the workspace's changes can be
+     * compared with. Daemons older than the route answer `404`.
+     */
+    async listWorkspaceBranches(
+        workspaceId: Cuid2,
+        query: ListWorkspaceBranchesQuery = {},
+        options: RequestOptions = {},
+    ): Promise<ListWorkspaceBranchesResponse> {
+        return await this.#json({
+            method: "GET",
+            path: `v0/workspaces/${encodeURIComponent(workspaceId)}/git/branches`,
+            query: { query: query.query, limit: query.limit },
             signal: options.signal,
         });
     }

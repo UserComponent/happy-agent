@@ -70,6 +70,31 @@ export interface GitStateResponse {
     git: GitState;
 }
 
+/** `GET /v0/workspaces/:workspaceId/git/branches` query. */
+export interface ListWorkspaceBranchesQuery {
+    /** A case-insensitive substring of at most 200 characters. */
+    query?: string;
+    /** 1 to 200; the daemon defaults to 50. */
+    limit?: number;
+}
+
+/** One branch a workspace's changes can be compared with. */
+export interface GitBranch {
+    /** Written like `GitState.baseRef`, and accepted unchanged as `comparisonBase`. */
+    ref: string;
+    /** Whether `ref` is a remote-tracking branch. */
+    remote: boolean;
+    /** The tip commit's time, or `null` when it cannot be read. */
+    committedAt: Timestamp | null;
+}
+
+/** `GET /v0/workspaces/:workspaceId/git/branches` */
+export interface ListWorkspaceBranchesResponse {
+    branches: GitBranch[];
+    /** `true` when more branches matched than were returned. */
+    truncated: boolean;
+}
+
 /** `POST /v0/git/watch` */
 export interface WatchGitRequest {
     workspaceIds: Cuid2[];

@@ -46,6 +46,35 @@ describe("comparison branches", () => {
         ]);
     });
 
+    it("lists a workspace's branches with the query and limit", async () => {
+        const urls: string[] = [];
+        const response = {
+            branches: [{ committedAt: 1755400000000, ref: "origin/release-v8.8", remote: true }],
+            truncated: false,
+        };
+        const fetch: typeof globalThis.fetch = async (input) => {
+            urls.push(input.toString());
+            return new Response(JSON.stringify(response), {
+                headers: { "content-type": "application/json" },
+                status: 200,
+            });
+        };
+        const client = new HappyAgentClient({ endpoint: "http://agent.local", token: "t", fetch });
+
+        const filtered = await client.listWorkspaceBranches("w9x8y7z6", {
+            limit: 20,
+            query: "release",
+        });
+        const unfiltered = await client.listWorkspaceBranches("w9x8y7z6");
+
+        expect(filtered).toEqual(response);
+        expect(unfiltered).toEqual(response);
+        expect(urls).toEqual([
+            "http://agent.local/v0/workspaces/w9x8y7z6/git/branches?query=release&limit=20",
+            "http://agent.local/v0/workspaces/w9x8y7z6/git/branches",
+        ]);
+    });
+
     it("accepts branch names and rejects ones Git would read as options", () => {
         for (const comparisonBase of ["release-v8.8", "origin/release-v8.8", "feature/x", null]) {
             expect(Value.Check(updateWorkspaceRequestSchema, { comparisonBase })).toBe(true);
