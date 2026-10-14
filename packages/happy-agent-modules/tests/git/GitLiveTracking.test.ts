@@ -315,10 +315,11 @@ describe("GitModule live tracking", () => {
 
         module.track(recorded);
         await waitFor(() => module.trackedSnapshot(recorded) !== undefined);
+        // Without a recorded commit the nearer fork point decides: main forks from HEAD newer.
         expect(module.trackedSnapshot(recorded)).toMatchObject({
-            base: main,
-            baseSource: "workspace",
-            changedFiles: 2,
+            base: newerMain,
+            baseSource: "default",
+            changedFiles: 1,
         });
 
         // A state measured without the commit is a different comparison and is not reused.
@@ -330,7 +331,55 @@ describe("GitModule live tracking", () => {
             baseRef: "refs/remotes/origin/main",
             changedFiles: 1,
         });
-    });
+    }, 20_000); // Many Git commands run in sequence, and Git is slow on Windows.
+
+    it("moves a workspace to the default branch after a rebase onto a main that merged its branch", async () => {
+        const repository = await createRepository();
+        const main = await commitFile(repository, "base.txt", "base\n");
+        await git(repository, ["checkout", "--quiet", "-b", "release"]);
+        const release = await commitFile(repository, "release.txt", "release\n");
+        await git(repository, ["update-ref", "refs/remotes/origin/release-v8.8", release]);
+        // Main merges the release, then moves on.
+        await git(repository, ["checkout", "--quiet", "--detach", main]);
+        await git(repository, [
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            "Merge release",
+            release,
+        ]);
+        const newestMain = await commitFile(repository, "main-2.txt", "main 2\n");
+        await setOriginMain(repository, newestMain);
+        await git(repository, ["checkout", "--quiet", "-b", "fix", release]);
+        await commitFile(repository, "fix.txt", "fix\n");
+        const module = open();
+        const entity = {
+            path: repository,
+            projectId: "project-1",
+            recordedBaseCommit: release,
+            recordedBaseRef: "origin/release-v8.8",
+            workspaceId: "workspace-1",
+        };
+
+        module.track(entity);
+        await waitFor(() => module.trackedSnapshot(entity) !== undefined);
+        expect(module.trackedSnapshot(entity)).toMatchObject({
+            base: release,
+            baseSource: "workspace",
+            changedFiles: 1,
+        });
+
+        await git(repository, ["rebase", "--quiet", "origin/main"]);
+        await module.refresh(caller(), entity);
+        await waitFor(() => module.trackedSnapshot(entity)?.baseSource === "default");
+        expect(module.trackedSnapshot(entity)).toMatchObject({
+            base: newestMain,
+            baseRef: "refs/remotes/origin/main",
+            changedFiles: 1,
+        });
+    }, 20_000); // Many Git commands run in sequence, and Git is slow on Windows.
 });
 
 async function waitFor(predicate: () => boolean): Promise<void> {

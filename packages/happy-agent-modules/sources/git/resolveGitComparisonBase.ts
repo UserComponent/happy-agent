@@ -57,12 +57,12 @@ const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/u;
  * What a branch's changes are measured against.
  *
  * The comparison branch is, in order: the one a person chose for the workspace, the one the
- * workspace was created from unless that is just the default branch or HEAD no longer holds the
- * commit the workspace was created at, one the repository records for the branch itself (the ref
- * it was created from, its pull request base, or an upstream with a different name), and finally
- * the default branch. The base is that branch's merge base with
- * HEAD; HEAD itself (uncommitted work only) when no branch shares history; and the empty tree for
- * a repository without commits.
+ * workspace was created from unless that is just the default branch, HEAD no longer holds the
+ * commit the workspace was created at, or the default branch forks from HEAD at a newer commit,
+ * one the repository records for the branch itself (the ref it was created from, its pull
+ * request base, or an upstream with a different name), and finally the default branch. The base
+ * is that branch's merge base with HEAD; HEAD itself (uncommitted work only) when no branch
+ * shares history; and the empty tree for a repository without commits.
  *
  * Remote branches are found on the remote the current branch tracks, else `origin`, else the only
  * remote. A chosen or recorded branch that no longer exists falls through to the next with a
@@ -146,24 +146,35 @@ export async function resolveGitComparisonBase(options: {
     }
     const recorded = options.preferences?.recordedBaseRef;
     const createdAt = options.preferences?.recordedBaseCommit;
-    // A workspace records where it was cut, not where its branch lives now: one rebased or reset
-    // onto another branch no longer holds the commit it was created at, so its record no longer
-    // says what it is compared with and the repository is asked instead, without a notice.
+    // A workspace records where it was cut, not where its branch lives now. The record applies
+    // only while two things hold. First, HEAD still holds the commit the workspace was created at.
+    // Second, the default branch does not fork from HEAD at a newer commit than the recorded
+    // branch does. A workspace rebased or reset onto another branch fails the first test. A
+    // workspace rebased onto a default branch that merged the recorded branch keeps the cut
+    // commit but fails the second test. In both cases the repository is asked instead, without a
+    // notice.
+    let measuredDefault: { base: string; baseRef: string } | undefined;
     if (
         recorded !== undefined &&
         !isDefault(recorded) &&
-        (createdAt === undefined ||
-            (await tryRun(options.run, [
-                "merge-base",
-                "--is-ancestor",
-                "--end-of-options",
-                createdAt,
-                head,
-            ])) !== undefined)
+        (createdAt === undefined || (await isAncestor(options.run, createdAt, head)))
     ) {
         const found = await measure(recorded, "local");
-        if (found !== undefined) return finish(found, "workspace");
-        notices.push(`"${recorded}", the branch this workspace was created from, was not found.`);
+        if (found !== undefined) {
+            measuredDefault =
+                defaultBranch === undefined ? undefined : await measure(defaultBranch, "remote");
+            if (
+                measuredDefault === undefined ||
+                measuredDefault.base === found.base ||
+                !(await isAncestor(options.run, found.base, measuredDefault.base))
+            ) {
+                return finish(found, "workspace");
+            }
+        } else {
+            notices.push(
+                `"${recorded}", the branch this workspace was created from, was not found.`,
+            );
+        }
     }
 
     const previous = options.previous;
@@ -188,7 +199,7 @@ export async function resolveGitComparisonBase(options: {
     }
 
     if (defaultBranch !== undefined) {
-        const found = await measure(defaultBranch, "remote");
+        const found = measuredDefault ?? (await measure(defaultBranch, "remote"));
         if (found !== undefined) return finish(found, "default", checkedAt);
     }
     return {
@@ -313,6 +324,19 @@ function commandRunner(run: GitBaseRunner): GitCommandRunner {
             }
         },
     };
+}
+
+/** Whether `ancestor` is the same commit as `commit` or one of its parents, grandparents and so on. */
+async function isAncestor(run: GitBaseRunner, ancestor: string, commit: string): Promise<boolean> {
+    return (
+        (await tryRun(run, [
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            ancestor,
+            commit,
+        ])) !== undefined
+    );
 }
 
 async function tryRun(run: GitBaseRunner, args: readonly string[]): Promise<string | undefined> {

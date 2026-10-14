@@ -227,13 +227,64 @@ describe("resolveGitComparisonBase", () => {
                 baseSource: "default",
             });
 
-            // Without a recorded commit there is nothing to check the record against.
+            // Without a recorded commit there is nothing to check the record against, so the
+            // nearer fork point decides: main forks from HEAD at a newer commit than the release.
             await expect(
                 resolveOn(repository, moved, {
                     branch: "fix",
                     preferences: { recordedBaseRef: "origin/release-v8.8" },
                 }),
-            ).resolves.toMatchObject({ base: main, baseSource: "workspace" });
+            ).resolves.toMatchObject({ base: newerMain, baseSource: "default" });
+        }, 20_000); // Many Git commands run in sequence, and Git is slow on Windows.
+
+        it("drops the recorded branch once a rebase onto main that merged it makes main the nearer fork", async () => {
+            const { main, release, repository } = await releaseRepository();
+            await git(repository, ["checkout", "--quiet", "-b", "fix", release]);
+            const created = await commitFile(repository, "fix.txt", "fix\n");
+            const recorded = {
+                recordedBaseCommit: release,
+                recordedBaseRef: "origin/release-v8.8",
+            } as const;
+            // Main merges the release, then moves on.
+            await git(repository, ["checkout", "--quiet", "--detach", main]);
+            await git(repository, [
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "Merge release",
+                release,
+            ]);
+            const newestMain = await commitFile(repository, "main-2.txt", "main 2\n");
+            await setOriginMain(repository, newestMain);
+            await git(repository, ["checkout", "--quiet", "fix"]);
+            // Both the workspace and main hold the commit the workspace was cut at.
+            await git(repository, ["merge-base", "--is-ancestor", release, "HEAD"]);
+            await git(repository, ["merge-base", "--is-ancestor", release, "origin/main"]);
+
+            // Not rebased yet: both fork points are the release commit, so the record stays.
+            await expect(
+                resolveOn(repository, created, { branch: "fix", preferences: recorded }),
+            ).resolves.toEqual({
+                base: release,
+                baseRef: "refs/remotes/origin/release-v8.8",
+                baseSource: "workspace",
+            });
+            expect(await git(repository, ["merge-base", "origin/main", created])).toBe(release);
+
+            await git(repository, ["rebase", "--quiet", "origin/main"]);
+            const rebased = await git(repository, ["rev-parse", "HEAD"]);
+            // The rebase keeps the commit the workspace was cut at in its history.
+            await git(repository, ["merge-base", "--is-ancestor", release, rebased]);
+            await expect(
+                resolveOn(repository, rebased, { branch: "fix", preferences: recorded }),
+            ).resolves.toEqual({
+                base: newestMain,
+                baseCheckedAt: 1_000,
+                baseRef: "refs/remotes/origin/main",
+                baseSource: "default",
+            });
         });
 
         it("says so when a chosen branch is gone, instead of silently changing the numbers", async () => {

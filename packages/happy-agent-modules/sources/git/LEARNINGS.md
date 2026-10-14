@@ -55,6 +55,14 @@ applying. A ranking of candidate branches by distance was rejected as a heuristi
 per candidate. Asking whether `baseCommit` is on the recorded branch detects nothing, because it
 always is.
 
+A rebase onto main does not remove the cut commit when main has merged the release branch. HEAD
+still holds that commit, so the commit test alone keeps the old record. The recorded branch
+therefore applies only while its fork point with HEAD is at least as near as the default branch's
+fork point. If the default branch forks from HEAD at a newer commit, HEAD now lives on the default
+branch and the record is dropped, with no notice. Equal fork points keep the record. A recorded
+fork point that is newer or unrelated keeps it too. This costs one more measure and one
+`merge-base --is-ancestor` only when the two fork points differ.
+
 The base commit is part of the tracked entity, so a snapshot measured or remembered without it is
 never reused for a workspace that has one.
 
